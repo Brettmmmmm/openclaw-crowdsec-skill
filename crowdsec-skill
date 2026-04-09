@@ -1,13 +1,26 @@
 #!/usr/bin/env bash
-# crowdsec-skill — CrowdSec management for OpenClaw
+# crowdsec-skill — CrowdSec Sentinel for OpenClaw
 # MIT License — Brett Moore (InfraForesight Ltd)
 set -euo pipefail
 
 SCRIPT_NAME="crowdsec-skill"
-VERSION="1.1.0"
+VERSION="1.5.0"
 DEFAULT_BAN_DURATION="24h"
 DEFAULT_REPORT_PERIOD="24h"
 DEFAULT_LIMIT="20"
+CROWDSEC_LOG="/var/log/crowdsec/crowdsec.log"
+CROWDSEC_API_LOG="/var/log/crowdsec/crowdsec_api.log"
+OPENCLAW_WHITELIST="/etc/crowdsec/parsers/s02-enrich/whitelist-openclaw.yaml"
+AUTH_LOG="/var/log/auth.log"
+SYSLOG="/var/log/syslog"
+KERN_LOG="/var/log/kern.log"
+LOGROTATE_CONF="/etc/logrotate.d/crowdsec-openclaw"
+
+# Alert thresholds
+FAILED_LOGIN_WARN=5
+FAILED_LOGIN_CRIT=10
+BAN_COUNT_WARN=20
+LOG_RETENTION_DAYS=30
 
 # --- helpers ---
 
@@ -58,7 +71,6 @@ import sys, json
 try:
     data = json.load(sys.stdin)
     if data is None: data = []
-    # Count alerts from last hour
     from datetime import datetime, timedelta, timezone
     cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
     recent = [a for a in data if datetime.fromisoformat(a.get('created_at','2000-01-01T00:00:00Z').replace('Z','+00:00')) > cutoff]
@@ -78,10 +90,10 @@ except: print(0)
 EOF
   else
     echo "=== CrowdSec Status ==="
-    echo "Engine:          $crowdsec_ok"
+    echo "Engine:           $crowdsec_ok"
     echo "Firewall bouncer: $bouncer_ok"
-    echo "Active bans:     $bans"
-    echo "Alerts (1h):     $alerts"
+    echo "Active bans:      $bans"
+    echo "Alerts (1h):      $alerts"
   fi
 }
 
@@ -96,7 +108,6 @@ try:
     if not alerts:
         print('No active bans.')
         sys.exit(0)
-    # Extract decisions from nested alert structure
     decisions = []
     for alert in alerts:
         for d in alert.get('decisions', []) or []:
@@ -134,15 +145,12 @@ cmd_alerts() {
   require_cscli
   local since="${1:-1h}"
 
-  # Convert since to a format cscli understands
-  local since_flag=""
+  local since_flag="--since 24h"
   case "$since" in
     *h) since_flag="--since ${since%h}h" ;;
     *d) since_flag="--since $((${since%d} * 24))h" ;;
-    *)  since_flag="--since 24h" ;;
   esac
 
-  # shellcheck disable=SC2086
   cscli alerts list $since_flag -o json 2>/dev/null | python3 -c "
 import sys, json
 try:
@@ -160,7 +168,6 @@ try:
             source_ip = a['source'].get('ip', a['source'].get('value', '?'))
         events = str(a.get('events_count', '?'))
         scenario = a.get('scenario', '?')
-        # Strip crowdsecurity/ prefix for readability
         if scenario.startswith('crowdsecurity/'):
             scenario = scenario[14:]
         print(fmt.format(ts, str(source_ip)[:17], events, scenario))
@@ -180,7 +187,6 @@ cmd_ban() {
   local duration="${2:-$DEFAULT_BAN_DURATION}"
   local reason="${3:-manual ban via openclaw}"
 
-  # Validate IP format (basic check)
   if ! echo "$ip" | grep -qE '^[0-9a-fA-F.:]+(/[0-9]+)?$'; then
     die "Invalid IP address: $ip"
   fi
@@ -208,7 +214,7 @@ cmd_report() {
     *)  hours="24" ;;
   esac
 
-  local total_bans top_attackers scenarios_hit
+  local total_bans
 
   total_bans=$(cscli decisions list -o json 2>/dev/null | python3 -c "
 import sys, json
@@ -300,7 +306,6 @@ cmd_install() {
       ;;
   esac
 
-  # Generate bouncer API key and configure
   local api_key
   api_key=$(cscli bouncers add crowdsec-firewall-bouncer -o raw 2>/dev/null || true)
   if [ -n "$api_key" ] && [ -f /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml ]; then
@@ -308,16 +313,17 @@ cmd_install() {
     sed -i "s|api_key:.*|api_key: $api_key|g" /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
   fi
 
-  # Start services
   systemctl enable --now crowdsec
   systemctl enable --now crowdsec-firewall-bouncer
 
-  # Install recommended collections
   cscli collections install crowdsecurity/sshd 2>/dev/null || true
   cscli collections install crowdsecurity/linux 2>/dev/null || true
   cscli collections install crowdsecurity/iptables 2>/dev/null || true
   cscli collections install crowdsecurity/linux-lpe 2>/dev/null || true
   systemctl reload crowdsec
+
+  # Configure log rotation
+  cmd_logging setup
 
   echo ""
   echo "=== CrowdSec installed ==="
@@ -328,6 +334,7 @@ cmd_install() {
   echo "  $SCRIPT_NAME whitelist <your-ip>   # whitelist your IP"
   echo "  $SCRIPT_NAME collections           # see installed collections"
   echo "  $SCRIPT_NAME status                # check health"
+  echo "  $SCRIPT_NAME logging setup         # configure log rotation"
 }
 
 cmd_upgrade() {
@@ -398,7 +405,7 @@ cmd_whitelist() {
 
   local action="${1:?Usage: $SCRIPT_NAME whitelist <add|remove|list> [ip/cidr]}"
 
-  local wl_file="/etc/crowdsec/parsers/s02-enrich/whitelist-openclaw.yaml"
+  local wl_file="$OPENCLAW_WHITELIST"
 
   case "$action" in
     list)
@@ -422,15 +429,12 @@ whitelist:
     - "::1"
 WLEOF
       fi
-      # Check if it's a CIDR or plain IP
       if echo "$entry" | grep -q "/"; then
-        # Add as CIDR — ensure cidr: section exists
         if ! grep -q "^  cidr:" "$wl_file"; then
           echo "  cidr:" >> "$wl_file"
         fi
         echo "    - \"$entry\"" >> "$wl_file"
       else
-        # Add as IP under the ip: section
         sed -i "/^  ip:/a\\    - \"$entry\"" "$wl_file"
       fi
       systemctl reload crowdsec
@@ -490,29 +494,736 @@ cmd_services() {
   esac
 }
 
+cmd_firewall() {
+  require_root
+
+  local action="${1:-status}"
+  local bouncer_type
+
+  if systemctl is-active --quiet crowdsec-firewall-bouncer-iptables 2>/dev/null || \
+     [ -f /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml ]; then
+    bouncer_type="iptables"
+  elif systemctl is-active --quiet crowdsec-firewall-bouncer-ufw 2>/dev/null; then
+    bouncer_type="ufw"
+  else
+    bouncer_type="unknown"
+  fi
+
+  case "$action" in
+    status)
+      echo "=== Firewall Status ==="
+      echo "Bouncer type: $bouncer_type"
+      echo ""
+      if [ "$bouncer_type" = "iptables" ]; then
+        echo "--- iptables crowdsec chain ---"
+        iptables -L crowdsec -n --line-numbers 2>/dev/null || echo "Chain not found"
+        echo ""
+        echo "--- Rules count ---"
+        local count
+        count=$(iptables -L crowdsec -n 2>/dev/null | grep -c "^" || echo "2")
+        if [ "$count" -gt 2 ] 2>/dev/null; then
+          echo "Active rules: $((count - 2))"
+        else
+          echo "Active rules: 0"
+        fi
+      elif [ "$bouncer_type" = "ufw" ]; then
+        echo "--- UFW Rules ---"
+        ufw status 2>/dev/null | grep -E "(DROP|REJECT)" | head -20 || echo "No UFW rules"
+      fi
+      ;;
+    reload)
+      echo "Reloading firewall bouncer..."
+      systemctl reload crowdsec-firewall-bouncer
+      echo "Reloaded."
+      ;;
+    flush)
+      echo "Flushing all CrowdSec bans..."
+      cscli decisions delete -a
+      if [ "$bouncer_type" = "iptables" ]; then
+        iptables -F crowdsec 2>/dev/null || true
+      fi
+      echo "All bans cleared."
+      ;;
+    switch)
+      local target="${2:-}"
+      if [ -z "$target" ]; then
+        echo "Usage: $SCRIPT_NAME firewall switch <iptables|ufw>"
+        echo "Current: $bouncer_type"
+        return 1
+      fi
+      echo "Switching to $target bouncer..."
+      systemctl stop crowdsec-firewall-bouncer
+      if [ "$target" = "ufw" ]; then
+        apt-get install -y crowdsec-firewall-bouncer-ufw 2>/dev/null || true
+        echo "Switched to UFW. Ensure UFW is enabled: ufw enable"
+      else
+        apt-get install -y crowdsec-firewall-bouncer-iptables 2>/dev/null || true
+        echo "Switched to iptables."
+      fi
+      systemctl start crowdsec-firewall-bouncer
+      ;;
+    *)
+      die "Unknown action: $action — use status, reload, flush, or switch"
+      ;;
+  esac
+}
+
+cmd_logs() {
+  local action="${1:-recent}"
+  local lines="${2:-20}"
+
+  case "$action" in
+    recent)
+      echo "=== Recent CrowdSec Logs ==="
+      if [ -f "$CROWDSEC_LOG" ]; then
+        tail -n "$lines" "$CROWDSEC_LOG"
+      else
+        journalctl -u crowdsec -n "$lines" --no-pager 2>/dev/null || echo "No logs found"
+      fi
+      ;;
+    errors)
+      echo "=== Error Logs ==="
+      if [ -f "$CROWDSEC_LOG" ]; then
+        grep -iE "error|fatal|critical" "$CROWDSEC_LOG" | tail -n "$lines"
+      else
+        journalctl -u crowdsec -p err -n "$lines" --no-pager 2>/dev/null || echo "No errors found"
+      fi
+      ;;
+    watch)
+      echo "Watching logs (Ctrl+C to stop)..."
+      if [ -f "$CROWDSEC_LOG" ]; then
+        tail -f "$CROWDSEC_LOG"
+      else
+        journalctl -u crowdsec -f 2>/dev/null || echo "Cannot watch logs"
+      fi
+      ;;
+    stats)
+      echo "=== Log Statistics ==="
+      if [ -f "$CROWDSEC_LOG" ]; then
+        echo "Log file: $CROWDSEC_LOG"
+        echo "Size: $(du -h "$CROWDSEC_LOG" | cut -f1)"
+        echo "Lines: $(wc -l < "$CROWDSEC_LOG")"
+        echo ""
+        echo "Events today:"
+        grep "$(date +%Y-%m-%d)" "$CROWDSEC_LOG" 2>/dev/null | wc -l || echo "0"
+      else
+        echo "Using journald"
+        journalctl -u crowdsec --since today --no-pager | wc -l
+      fi
+      ;;
+    *)
+      die "Unknown action: $action — use recent, errors, watch, or stats"
+      ;;
+  esac
+}
+
+cmd_auth() {
+  local action="${1:-recent}"
+  local lines="${2:-20}"
+
+  case "$action" in
+    recent)
+      echo "=== Recent Auth Events ==="
+      if [ -f "$AUTH_LOG" ]; then
+        tail -n "$lines" "$AUTH_LOG"
+      else
+        journalctl -t sshd -t sudo -t su -n "$lines" --no-pager 2>/dev/null || echo "No auth logs found"
+      fi
+      ;;
+    failed)
+      echo "=== Failed Login Attempts ==="
+      local count=0
+      if [ -f "$AUTH_LOG" ]; then
+        count=$(grep -ci "failed\|failure\|invalid" "$AUTH_LOG" 2>/dev/null | tail -1 || echo "0")
+        echo "Total failed attempts in log: $count"
+        echo ""
+        echo "Last $lines failures:"
+        grep -iE "failed|failure|invalid" "$AUTH_LOG" | tail -n "$lines"
+      else
+        journalctl -t sshd -p warning -n "$lines" --no-pager 2>/dev/null || echo "No failed logins found"
+      fi
+      ;;
+    success)
+      echo "=== Successful Logins ==="
+      if [ -f "$AUTH_LOG" ]; then
+        grep -i "accepted\|session opened" "$AUTH_LOG" | tail -n "$lines"
+      else
+        journalctl -t sshd | grep -i "accepted" | tail -n "$lines" 2>/dev/null || echo "No successful logins"
+      fi
+      ;;
+    sudo)
+      echo "=== Sudo Usage ==="
+      if [ -f "$AUTH_LOG" ]; then
+        grep "sudo:" "$AUTH_LOG" | tail -n "$lines"
+      else
+        journalctl -t sudo -n "$lines" --no-pager 2>/dev/null || echo "No sudo usage found"
+      fi
+      ;;
+    stats)
+      echo "=== Auth Log Statistics ==="
+      if [ -f "$AUTH_LOG" ]; then
+        echo "Log file: $AUTH_LOG"
+        echo "Size: $(du -h "$AUTH_LOG" | cut -f1)"
+        echo ""
+        echo "Today's activity:"
+        local today
+        today=$(date +%Y-%m-%d)
+        echo "  Failed logins: $(grep -c "$(date +%b.*$today).*[Ff]ailed" "$AUTH_LOG" 2>/dev/null || echo "0")"
+        echo "  Successful: $(grep -c "$(date +%b.*$today).*[Aa]ccepted" "$AUTH_LOG" 2>/dev/null || echo "0")"
+        echo "  Sudo commands: $(grep -c "$(date +%b.*$today).*sudo:" "$AUTH_LOG" 2>/dev/null || echo "0")"
+      else
+        echo "Using journald"
+        echo "  SSH events today: $(journalctl -t sshd --since today --no-pager | wc -l)"
+      fi
+      ;;
+    *)
+      die "Unknown action: $action — use recent, failed, success, sudo, or stats"
+      ;;
+  esac
+}
+
+cmd_syslog() {
+  local action="${1:-recent}"
+  local lines="${2:-20}"
+
+  case "$action" in
+    recent)
+      echo "=== Recent Syslog Entries ==="
+      if [ -f "$SYSLOG" ]; then
+        tail -n "$lines" "$SYSLOG"
+      else
+        journalctl -n "$lines" --no-pager 2>/dev/null || echo "No syslog found"
+      fi
+      ;;
+    errors)
+      echo "=== Syslog Errors ==="
+      if [ -f "$SYSLOG" ]; then
+        grep -iE "error|critical|emergency|alert" "$SYSLOG" | tail -n "$lines"
+      else
+        journalctl -p err -n "$lines" --no-pager 2>/dev/null || echo "No errors found"
+      fi
+      ;;
+    kernel)
+      echo "=== Kernel Messages (dmesg) ==="
+      if [ -f "$KERN_LOG" ]; then
+        tail -n "$lines" "$KERN_LOG"
+      else
+        dmesg | tail -n "$lines" 2>/dev/null || journalctl -k -n "$lines" --no-pager 2>/dev/null || echo "No kernel logs"
+      fi
+      ;;
+    security)
+      echo "=== Security-Related Syslog ==="
+      if [ -f "$SYSLOG" ]; then
+        grep -iE "security|violation|unauthorized|attack|intrusion|crowdsec" "$SYSLOG" | tail -n "$lines"
+      else
+        journalctl | grep -iE "security|violation|unauthorized|attack|intrusion|crowdsec" | tail -n "$lines" 2>/dev/null || echo "No security events"
+      fi
+      ;;
+    *)
+      die "Unknown action: $action — use recent, errors, kernel, or security"
+      ;;
+  esac
+}
+
+cmd_alert() {
+  require_cscli
+
+  local check_type="${1:-all}"
+
+  echo "=== Proactive Security Alert Check ==="
+  echo "Timestamp: $(date -Iseconds)"
+  echo ""
+
+  local alerts_count=0
+  local ban_count=0
+  local failed_logins=0
+  local service_status="OK"
+
+  # Check active bans
+  ban_count=$(cscli decisions list -o json 2>/dev/null | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    print(len(data) if data else 0)
+except: print(0)
+" 2>/dev/null || echo "0")
+
+  if [ "$ban_count" -ge "$BAN_COUNT_WARN" ]; then
+    echo "⚠️  WARNING: High number of active bans ($ban_count)"
+    alerts_count=$((alerts_count + 1))
+  else
+    echo "✓ Active bans: $ban_count (normal)"
+  fi
+
+  # Check recent alerts
+  local recent_alerts
+  recent_alerts=$(cscli alerts list --since 1h -o json 2>/dev/null | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    print(len(data) if data else 0)
+except: print(0)
+" 2>/dev/null || echo "0")
+
+  if [ "$recent_alerts" -ge 10 ]; then
+    echo "⚠️  WARNING: High alert activity ($recent_alerts alerts/hour)"
+    alerts_count=$((alerts_count + 1))
+  else
+    echo "✓ Alerts (1h): $recent_alerts (normal)"
+  fi
+
+  # Check failed logins
+  if [ -f "$AUTH_LOG" ]; then
+    failed_logins=$(grep -c "$(date +%b.*$(date +%d)).*[Ff]ailed" "$AUTH_LOG" 2>/dev/null || echo "0")
+  else
+    failed_logins=$(journalctl -t sshd --since today --no-pager | grep -ci "failed" || echo "0")
+  fi
+
+  if [ "$failed_logins" -ge "$FAILED_LOGIN_CRIT" ]; then
+    echo "🚨 CRITICAL: High failed login attempts today ($failed_logins)"
+    alerts_count=$((alerts_count + 2))
+    service_status="CRITICAL"
+  elif [ "$failed_logins" -ge "$FAILED_LOGIN_WARN" ]; then
+    echo "⚠️  WARNING: Elevated failed logins ($failed_logins today)"
+    alerts_count=$((alerts_count + 1))
+  else
+    echo "✓ Failed logins today: $failed_logins (normal)"
+  fi
+
+  # Check services
+  local crowdsec_status
+  crowdsec_status=$(systemctl is-active crowdsec 2>/dev/null || echo "inactive")
+  if [ "$crowdsec_status" != "active" ]; then
+    echo "🚨 CRITICAL: CrowdSec service is $crowdsec_status"
+    alerts_count=$((alerts_count + 2))
+    service_status="CRITICAL"
+  else
+    echo "✓ CrowdSec service: active"
+  fi
+
+  local bouncer_status
+  bouncer_status=$(systemctl is-active crowdsec-firewall-bouncer 2>/dev/null || echo "inactive")
+  if [ "$bouncer_status" != "active" ]; then
+    echo "🚨 CRITICAL: Firewall bouncer is $bouncer_status"
+    alerts_count=$((alerts_count + 2))
+    service_status="CRITICAL"
+  else
+    echo "✓ Firewall bouncer: active"
+  fi
+
+  echo ""
+  echo "=== Summary ==="
+  if [ "$alerts_count" -eq 0 ]; then
+    echo "Status: ALL CLEAR - No security issues detected"
+    echo "OpenClaw: No alert needed"
+  elif [ "$alerts_count" -le 2 ]; then
+    echo "Status: WARNING - $alerts_count issue(s) detected"
+    echo "OpenClaw: Send digest alert to user"
+  else
+    echo "Status: CRITICAL - Immediate attention required"
+    echo "OpenClaw: Send immediate alert to user via WhatsApp"
+  fi
+
+  # Return code for automation
+  if [ "$alerts_count" -gt 2 ]; then
+    return 2
+  elif [ "$alerts_count" -gt 0 ]; then
+    return 1
+  fi
+  return 0
+}
+
+cmd_hardening() {
+  require_root
+
+  echo "=== VPA Security Hardening Check ==="
+  echo "Timestamp: $(date -Iseconds)"
+  echo ""
+
+  local issues=0
+
+  # Check SSH configuration
+  echo "--- SSH Configuration ---"
+  if [ -f /etc/ssh/sshd_config ]; then
+    if grep -q "^PermitRootLogin yes" /etc/ssh/sshd_config 2>/dev/null; then
+      echo "⚠️  Root login permitted via SSH"
+      issues=$((issues + 1))
+    else
+      echo "✓ Root login disabled"
+    fi
+
+    if grep -q "^PasswordAuthentication yes" /etc/ssh/sshd_config 2>/dev/null; then
+      echo "⚠️  Password authentication enabled (consider key-only)"
+      issues=$((issues + 1))
+    else
+      echo "✓ Password authentication disabled"
+    fi
+
+    if grep -q "^PermitEmptyPasswords yes" /etc/ssh/sshd_config 2>/dev/null; then
+      echo "🚨 Empty passwords permitted!"
+      issues=$((issues + 2))
+    else
+      echo "✓ Empty passwords disabled"
+    fi
+  else
+    echo "ℹ️  SSH config not found (may use defaults)"
+  fi
+
+  # Check firewall
+  echo ""
+  echo "--- Firewall Status ---"
+  if systemctl is-active --quiet ufw 2>/dev/null; then
+    echo "✓ UFW firewall active"
+  elif iptables -L INPUT -n 2>/dev/null | grep -q "ACCEPT"; then
+    echo "✓ iptables rules present"
+  else
+    echo "⚠️  Firewall status unclear"
+    issues=$((issues + 1))
+  fi
+
+  # Check for CrowdSec
+  echo ""
+  echo "--- Security Monitoring ---"
+  if command -v cscli >/dev/null 2>&1; then
+    echo "✓ CrowdSec installed"
+  else
+    echo "⚠️  CrowdSec not installed"
+    issues=$((issues + 1))
+  fi
+
+  if systemctl is-active --quiet crowdsec 2>/dev/null; then
+    echo "✓ CrowdSec service running"
+  else
+    echo "⚠️  CrowdSec service not running"
+    issues=$((issues + 1))
+  fi
+
+  # Check fail2ban (should not run with CrowdSec)
+  if systemctl is-active --quiet fail2ban 2>/dev/null; then
+    echo "⚠️  Fail2ban running (conflicts with CrowdSec)"
+    issues=$((issues + 1))
+  else
+    echo "✓ Fail2ban not running (good)"
+  fi
+
+  # Check automatic security updates
+  echo ""
+  echo "--- Updates ---"
+  if dpkg -l | grep -q unattended-upgrades 2>/dev/null; then
+    echo "✓ Unattended upgrades installed"
+  else
+    echo "⚠️  Unattended upgrades not installed"
+    issues=$((issues + 1))
+  fi
+
+  # Check for world-writable files
+  echo ""
+  echo "--- File Permissions ---"
+  local ww_count
+  ww_count=$(find /etc -type f -perm -002 2>/dev/null | wc -l)
+  if [ "$ww_count" -gt 0 ]; then
+    echo "⚠️  $ww_count world-writable files in /etc"
+    issues=$((issues + 1))
+  else
+    echo "✓ No world-writable files in /etc"
+  fi
+
+  echo ""
+  echo "=== Summary ==="
+  if [ "$issues" -eq 0 ]; then
+    echo "Status: HARDENED - All security checks passed"
+  elif [ "$issues" -le 2 ]; then
+    echo "Status: NEEDS ATTENTION - $issues issue(s) found"
+    echo "Recommendation: Run 'crowdsec-skill hardening --fix' for auto-fixes"
+  else
+    echo "Status: VULNERABLE - $issues security issues detected"
+    echo "Recommendation: Address critical issues immediately"
+  fi
+}
+
+cmd_logging() {
+  require_root
+
+  local action="${1:-status}"
+
+  case "$action" in
+    status)
+      echo "=== Logging Configuration Status ==="
+      echo ""
+      echo "--- Log Files ---"
+      if [ -f "$CROWDSEC_LOG" ]; then
+        echo "CrowdSec log: $CROWDSEC_LOG ($(du -h "$CROWDSEC_LOG" | cut -f1))"
+      else
+        echo "CrowdSec log: Using journald"
+      fi
+
+      if [ -f "$CROWDSEC_API_LOG" ]; then
+        echo "API log: $CROWDSEC_API_LOG ($(du -h "$CROWDSEC_API_LOG" | cut -f1))"
+      fi
+
+      echo ""
+      echo "--- Log Rotation ---"
+      if [ -f "$LOGROTATE_CONF" ]; then
+        echo "Rotation config: $LOGROTATE_CONF"
+        cat "$LOGROTATE_CONF"
+      else
+        echo "⚠️  No custom log rotation configured"
+        echo "Recommendation: Run '$SCRIPT_NAME logging setup'"
+      fi
+
+      echo ""
+      echo "--- Journald Settings ---"
+      if [ -f /etc/systemd/journald.conf ]; then
+        grep -E "^SystemMaxUse|^MaxRetentionSec" /etc/systemd/journald.conf 2>/dev/null || echo "Using defaults"
+      fi
+      ;;
+
+    setup)
+      echo "=== Setting Up Log Rotation ==="
+      echo ""
+
+      # Create logrotate configuration
+      cat > "$LOGROTATE_CONF" << 'ROTATEEOF'
+/var/log/crowdsec/*.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root adm
+    postrotate
+        systemctl reload crowdsec > /dev/null 2>&1 || true
+    endscript
+}
+ROTATEEOF
+
+      chmod 644 "$LOGROTATE_CONF"
+      echo "✓ Created log rotation config: $LOGROTATE_CONF"
+      echo "  - Daily rotation"
+      echo "  - Retain 30 days"
+      echo "  - Compress old logs"
+      echo "  - Reload CrowdSec after rotation"
+
+      # Ensure log directory exists with correct permissions
+      if [ ! -d /var/log/crowdsec ]; then
+        mkdir -p /var/log/crowdsec
+        chmod 755 /var/log/crowdsec
+        echo "✓ Created log directory: /var/log/crowdsec"
+      fi
+
+      # Test logrotate config
+      if command -v logrotate >/dev/null 2>&1; then
+        logrotate -d "$LOGROTATE_CONF" 2>&1 | head -5 || true
+        echo ""
+        echo "✓ Log rotation configured successfully"
+      else
+        echo "⚠️  logrotate not installed, but config file created"
+      fi
+      ;;
+
+    retention)
+      local days="${2:-$LOG_RETENTION_DAYS}"
+      echo "=== Log Retention Management ==="
+      echo "Current retention setting: $days days"
+      echo ""
+
+      # Update logrotate config with new retention
+      if [ -f "$LOGROTATE_CONF" ]; then
+        sed -i "s/rotate [0-9]*/rotate $days/" "$LOGROTATE_CONF"
+        echo "✓ Updated retention to $days days in $LOGROTATE_CONF"
+      else
+        echo "⚠️  No logrotate config found. Run '$SCRIPT_NAME logging setup' first."
+      fi
+
+      # Clean old logs immediately
+      echo ""
+      echo "Cleaning logs older than $days days..."
+      if [ -d /var/log/crowdsec ]; then
+        find /var/log/crowdsec -name "*.log.*" -mtime +"$days" -delete 2>/dev/null || true
+        echo "✓ Old compressed logs cleaned"
+      fi
+      ;;
+
+    report)
+      local period="${2:-7d}"
+      echo "=== Log Analysis Report ==="
+      echo "Period: $period"
+      echo "Generated: $(date -Iseconds)"
+      echo ""
+
+      local hours
+      case "$period" in
+        *h) hours="${period%h}" ;;
+        *d) hours="$((${period%d} * 24))" ;;
+        *)  hours="168" ;;
+      esac
+
+      echo "--- CrowdSec Activity ---"
+      if [ -f "$CROWDSEC_LOG" ]; then
+        local total_lines
+        total_lines=$(wc -l < "$CROWDSEC_LOG")
+        echo "Total log entries: $total_lines"
+
+        local error_count
+        error_count=$(grep -ciE "error|fatal|critical" "$CROWDSEC_LOG" 2>/dev/null || echo "0")
+        echo "Error entries: $error_count"
+
+        local ban_events
+        ban_events=$(grep -c "ban\|decision" "$CROWDSEC_LOG" 2>/dev/null || echo "0")
+        echo "Ban-related events: $ban_events"
+      else
+        echo "Using journald"
+        echo "Entries (period): $(journalctl -u crowdsec --since "$hours hours ago" --no-pager | wc -l)"
+      fi
+
+      echo ""
+      echo "--- Auth Log Summary ---"
+      if [ -f "$AUTH_LOG" ]; then
+        local failed_today
+        failed_today=$(grep -c "$(date +%b.*$(date +%d)).*[Ff]ailed" "$AUTH_LOG" 2>/dev/null || echo "0")
+        echo "Failed logins today: $failed_today"
+
+        local success_today
+        success_today=$(grep -c "$(date +%b.*$(date +%d)).*[Aa]ccepted" "$AUTH_LOG" 2>/dev/null || echo "0")
+        echo "Successful logins today: $success_today"
+      fi
+
+      echo ""
+      echo "--- Disk Usage ---"
+      if [ -d /var/log/crowdsec ]; then
+        echo "CrowdSec logs: $(du -sh /var/log/crowdsec 2>/dev/null | cut -f1)"
+      fi
+      echo "Auth log: $(du -h "$AUTH_LOG" 2>/dev/null | cut -f1 || echo "N/A")"
+      echo "Syslog: $(du -h "$SYSLOG" 2>/dev/null | cut -f1 || echo "N/A")"
+      ;;
+
+    rotate)
+      echo "=== Forcing Log Rotation ==="
+      if command -v logrotate >/dev/null 2>&1; then
+        logrotate -f "$LOGROTATE_CONF" 2>/dev/null && echo "✓ Logs rotated successfully" || echo "⚠️  Rotation failed"
+      else
+        echo "⚠️  logrotate not installed"
+        echo "Manual rotation:"
+        if [ -f "$CROWDSEC_LOG" ]; then
+          mv "$CROWDSEC_LOG" "${CROWDSEC_LOG}.$(date +%Y%m%d%H%M%S)"
+          touch "$CROWDSEC_LOG"
+          chmod 0640 "$CROWDSEC_LOG"
+          systemctl reload crowdsec
+          echo "✓ Manual rotation completed"
+        fi
+      fi
+      ;;
+
+    *)
+      die "Unknown action: $action — use status, setup, retention, report, or rotate"
+      ;;
+  esac
+}
+
+cmd_compare() {
+  cat <<EOF
+=== CrowdSec vs Fail2ban ===
+
+CrowdSec is the modern, collaborative replacement for Fail2ban.
+
+Key Advantages:
+
+1. COLLABORATIVE THREAT INTELLIGENCE
+   - Fail2ban: Local-only, protects only your server
+   - CrowdSec: 50,000+ users share threat data globally
+   - Impact: Attacker blocked by one user is blocked for all
+
+2. BEHAVIORAL DETECTION
+   - Fail2ban: Simple regex matching on log lines
+   - CrowdSec: Scenario-based pattern analysis over time
+   - Impact: Catches sophisticated attacks that regex misses
+
+3. PERFORMANCE & SCALABILITY
+   - Fail2ban: Python-based, struggles under high load
+   - CrowdSec: C-based core, efficient event processing
+   - Impact: Handles DDoS and brute-force attacks without lag
+
+4. CLOUD-NATIVE ARCHITECTURE
+   - Fail2ban: Designed for bare-metal servers
+   - CrowdSec: Built for Docker, Kubernetes, cloud firewalls
+   - Impact: Works seamlessly in modern infrastructure
+
+5. FLEXIBLE ENFORCEMENT
+   - Fail2ban: Directly tied to iptables/nftables
+   - CrowdSec: Bouncer system (iptables, nginx, cloud APIs)
+   - Impact: Ban at any level from single detection
+
+6. COMMUNITY HUB
+   - Fail2ban: Manual configuration, community filters limited
+   - CrowdSec: 500+ pre-built scenarios, parsers, collections
+   - Impact: Less config time, more protection out of the box
+
+7. FALSE POSITIVE REDUCTION
+   - Fail2ban: Manual tuning required
+   - CrowdSec: Community-validated scenarios, IP reputation
+   - Impact: Fewer legitimate users accidentally banned
+
+Real-World Example:
+
+Fail2ban: Attacker probes -> Log written -> Regex matches -> Ban
+  (Detection AFTER the fact, only on your server)
+
+CrowdSec: Pattern detected -> IP reputation check -> Instant ban
+  -> Share with community -> All users protected
+  (Detection DURING attack, global protection)
+
+For OpenClaw: CrowdSec means your agents benefit from global
+threat intelligence, not just local log parsing.
+
+Learn more: https://www.crowdsec.net/why-crowdsec
+EOF
+}
+
 cmd_help() {
   cat <<EOF
-$SCRIPT_NAME v$VERSION — CrowdSec skill for OpenClaw
+$SCRIPT_NAME v$VERSION — CrowdSec Sentinel for OpenClaw
 
 Usage: $SCRIPT_NAME <command> [options]
 
-Monitoring:
+Security Monitoring:
   status                          Overview: bans, alerts, service health
   bans [limit]                    List active bans (default: 20)
   alerts [since]                  Recent alerts (e.g. 1h, 24h, 7d)
   metrics                         Full CrowdSec metrics
   report [period]                 Security summary (e.g. 24h, 7d, 30d)
 
+Proactive Alerting:
+  alert                           Proactive security check with exit codes
+
 Actions:
   ban <ip> [dur] [reason]         Ban an IP (default: 24h)
   unban <ip>                      Remove ban for an IP
 
+System Logs (OpenClaw Integration):
+  auth <recent|failed|success|sudo|stats>  Authentication logs
+  syslog <recent|errors|kernel|security>   System logs
+  logs <recent|errors|watch|stats>         CrowdSec logs
+
+Firewall & Whitelist:
+  firewall <status|reload|flush|switch>    Manage firewall rules
+  whitelist <add|remove|list> [ip/cidr]    Manage IP whitelist
+
+Logging & Retention:
+  logging <status|setup|report|rotate>     Log management
+  logging retention <days>                 Set retention period
+
 Install & Manage:
-  install                         Install CrowdSec + bouncer + recommended collections
+  install                         Install CrowdSec + bouncer + collections
   upgrade                         Upgrade CrowdSec and hub content
   services <start|stop|restart|health>  Manage CrowdSec services
-  collections <list|available|install|remove> [name]  Manage detection collections
-  whitelist <add|remove|list> [ip/cidr]  Manage IP whitelist
+  collections <list|available|install|remove> [name]  Manage collections
+
+Hardening:
+  hardening                       Security best practices checker
+
+Comparison:
+  compare                         Explain why CrowdSec > Fail2ban
 
 Other:
   help                            This help message
@@ -523,10 +1234,14 @@ Environment:
 Examples:
   $SCRIPT_NAME install
   $SCRIPT_NAME status
-  $SCRIPT_NAME ban 1.2.3.4 48h "port scanning"
-  $SCRIPT_NAME report 7d
-  $SCRIPT_NAME whitelist add 10.0.0.0/8
-  $SCRIPT_NAME collections install crowdsecurity/nginx
+  $SCRIPT_NAME alert              # Proactive check for OpenClaw alerts
+  $SCRIPT_NAME auth failed        # Check failed logins
+  $SCRIPT_NAME logging setup      # Configure log rotation
+  $SCRIPT_NAME logging report 7d  # Weekly log report
+  $SCRIPT_NAME logging retention 30  # Keep 30 days
+  $SCRIPT_NAME hardening          # Security best practices check
+  $SCRIPT_NAME firewall status
+  $SCRIPT_NAME compare
 EOF
 }
 
@@ -545,6 +1260,14 @@ case "${1:-help}" in
   collections) shift; cmd_collections "$@" ;;
   whitelist)   shift; cmd_whitelist "$@" ;;
   services)    shift; cmd_services "$@" ;;
+  firewall)    shift; cmd_firewall "$@" ;;
+  logs)        shift; cmd_logs "$@" ;;
+  auth)        shift; cmd_auth "$@" ;;
+  syslog)      shift; cmd_syslog "$@" ;;
+  alert)       cmd_alert ;;
+  hardening)   cmd_hardening ;;
+  logging)     shift; cmd_logging "$@" ;;
+  compare)     cmd_compare ;;
   help|--help|-h) cmd_help ;;
   version|--version|-v) echo "$SCRIPT_NAME v$VERSION" ;;
   *)           die "Unknown command: $1 — run '$SCRIPT_NAME help'" ;;

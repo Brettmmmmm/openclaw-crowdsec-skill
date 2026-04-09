@@ -1,9 +1,11 @@
 {
-  "name": "crowdsec",
-  "version": "1.1.0",
-  "description": "CrowdSec security monitoring, installation, and management skill for OpenClaw. Install, upgrade, query bans, alerts, metrics, manage collections, whitelists, and decisions via agent commands.",
+  "name": "crowdsec-sentinel",
+  "version": "1.5.0",
+  "description": "CrowdSec Sentinel: Comprehensive security monitoring for OpenClaw. CrowdSec intrusion detection, proactive alerting, auth/syslog monitoring, security hardening, firewall management (iptables/UFW), and professional log management with rotation, retention, and reporting. Superior to Fail2ban.",
   "author": "Brett Moore (InfraForesight Ltd)",
-  "tags": ["security", "crowdsec", "firewall", "monitoring", "ssh", "intrusion-detection"],
+  "tags": ["security", "crowdsec", "firewall", "monitoring", "ssh", "intrusion-detection", "fail2ban-alternative", "iptables", "ufw", "logging", "logrotate", "hardening", "sentinel"],
   "repository": "https://github.com/Brettmmmmm/openclaw-crowdsec-skill",
-  "license": "MIT"
+  "license": "MIT",
+  "clawhub_category": "security-monitoring",
+  "clawhub_featured": true
 }
