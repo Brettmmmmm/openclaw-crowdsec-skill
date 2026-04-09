@@ -1,7 +1,7 @@
 {
   "name": "crowdsec",
-  "version": "1.0.0",
-  "description": "CrowdSec security monitoring and management skill for OpenClaw. Query bans, alerts, metrics, and manage decisions via agent commands.",
+  "version": "1.1.0",
+  "description": "CrowdSec security monitoring, installation, and management skill for OpenClaw. Install, upgrade, query bans, alerts, metrics, manage collections, whitelists, and decisions via agent commands.",
   "author": "Brett Moore (InfraForesight Ltd)",
   "tags": ["security", "crowdsec", "firewall", "monitoring", "ssh", "intrusion-detection"],
   "repository": "https://github.com/Brettmmmmm/openclaw-crowdsec-skill",

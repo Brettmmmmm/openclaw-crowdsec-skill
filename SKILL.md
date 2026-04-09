@@ -14,13 +14,37 @@ triggers:
   - "security report"
   - "intrusion"
   - "blocked ips"
+  - "install crowdsec"
+  - "upgrade crowdsec"
+  - "whitelist ip"
+  - "crowdsec collections"
 ---
 
 # CrowdSec Security Skill
 
-Monitor and manage CrowdSec intrusion detection from any OpenClaw agent.
+Install, monitor, and manage CrowdSec intrusion detection from any OpenClaw agent.
 
 ## Commands
+
+### Install CrowdSec
+Trigger: "install crowdsec", "set up crowdsec"
+
+```bash
+crowdsec-skill install
+```
+
+Installs CrowdSec engine + firewall bouncer, configures API key,
+installs recommended collections (sshd, linux, iptables, linux-lpe),
+and starts all services. Supports Debian/Ubuntu and RHEL/CentOS/Fedora.
+
+### Upgrade CrowdSec
+Trigger: "upgrade crowdsec", "update crowdsec"
+
+```bash
+crowdsec-skill upgrade
+```
+
+Upgrades packages, hub content, and restarts services.
 
 ### Status Overview
 Trigger: "security status", "crowdsec status", "are we under attack"
@@ -103,4 +127,27 @@ Pulse -> delivers via WhatsApp
 ```
 Pulse -> crowdsec-skill report --period 24h
 Pulse -> delivers summary via WhatsApp
+```
+
+### Manage Collections
+```bash
+crowdsec-skill collections list              # show installed
+crowdsec-skill collections available         # show all available
+crowdsec-skill collections install crowdsecurity/nginx
+crowdsec-skill collections remove crowdsecurity/nginx
+```
+
+### Manage Whitelist
+```bash
+crowdsec-skill whitelist list
+crowdsec-skill whitelist add 10.0.0.0/8
+crowdsec-skill whitelist remove 1.2.3.4
+```
+
+### Service Management
+```bash
+crowdsec-skill services health    # full health check
+crowdsec-skill services restart   # restart engine + bouncer
+crowdsec-skill services stop
+crowdsec-skill services start
 ```

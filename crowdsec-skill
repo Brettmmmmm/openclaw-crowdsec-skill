@@ -4,7 +4,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="crowdsec-skill"
-VERSION="1.0.0"
+VERSION="1.1.0"
 DEFAULT_BAN_DURATION="24h"
 DEFAULT_REPORT_PERIOD="24h"
 DEFAULT_LIMIT="20"
@@ -14,7 +14,21 @@ DEFAULT_LIMIT="20"
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 require_cscli() {
-  command -v cscli >/dev/null 2>&1 || die "cscli not found — is CrowdSec installed?"
+  command -v cscli >/dev/null 2>&1 || die "cscli not found — run '$SCRIPT_NAME install' first"
+}
+
+require_root() {
+  [ "$(id -u)" -eq 0 ] || die "This command requires root privileges"
+}
+
+detect_os() {
+  if [ -f /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    echo "$ID"
+  else
+    die "Cannot detect OS — /etc/os-release not found"
+  fi
 }
 
 json_output() {
@@ -254,44 +268,284 @@ except Exception as e:
   echo "CrowdSec engine:  $engine_status"
 }
 
+cmd_install() {
+  require_root
+
+  if command -v cscli >/dev/null 2>&1; then
+    echo "CrowdSec is already installed: $(cscli version 2>/dev/null | head -1)"
+    echo "Use '$SCRIPT_NAME upgrade' to update."
+    return 0
+  fi
+
+  local os
+  os=$(detect_os)
+  echo "Installing CrowdSec on $os..."
+
+  case "$os" in
+    ubuntu|debian)
+      curl -s https://install.crowdsec.net | bash
+      apt-get update -qq
+      apt-get install -y crowdsec crowdsec-firewall-bouncer-iptables
+      ;;
+    centos|rhel|rocky|almalinux|fedora)
+      curl -s https://install.crowdsec.net | bash
+      if command -v dnf >/dev/null 2>&1; then
+        dnf install -y crowdsec crowdsec-firewall-bouncer-iptables
+      else
+        yum install -y crowdsec crowdsec-firewall-bouncer-iptables
+      fi
+      ;;
+    *)
+      die "Unsupported OS: $os — install CrowdSec manually: https://docs.crowdsec.net/docs/getting_started/install_crowdsec"
+      ;;
+  esac
+
+  # Generate bouncer API key and configure
+  local api_key
+  api_key=$(cscli bouncers add crowdsec-firewall-bouncer -o raw 2>/dev/null || true)
+  if [ -n "$api_key" ] && [ -f /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml ]; then
+    sed -i "s|\${API_KEY}|$api_key|g" /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
+    sed -i "s|api_key:.*|api_key: $api_key|g" /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
+  fi
+
+  # Start services
+  systemctl enable --now crowdsec
+  systemctl enable --now crowdsec-firewall-bouncer
+
+  # Install recommended collections
+  cscli collections install crowdsecurity/sshd 2>/dev/null || true
+  cscli collections install crowdsecurity/linux 2>/dev/null || true
+  cscli collections install crowdsecurity/iptables 2>/dev/null || true
+  cscli collections install crowdsecurity/linux-lpe 2>/dev/null || true
+  systemctl reload crowdsec
+
+  echo ""
+  echo "=== CrowdSec installed ==="
+  echo "Engine:  $(systemctl is-active crowdsec)"
+  echo "Bouncer: $(systemctl is-active crowdsec-firewall-bouncer)"
+  echo ""
+  echo "Next steps:"
+  echo "  $SCRIPT_NAME whitelist <your-ip>   # whitelist your IP"
+  echo "  $SCRIPT_NAME collections           # see installed collections"
+  echo "  $SCRIPT_NAME status                # check health"
+}
+
+cmd_upgrade() {
+  require_root
+  require_cscli
+
+  echo "Upgrading CrowdSec..."
+  local os
+  os=$(detect_os)
+
+  case "$os" in
+    ubuntu|debian)
+      apt-get update -qq && apt-get install --only-upgrade -y crowdsec crowdsec-firewall-bouncer-iptables
+      ;;
+    centos|rhel|rocky|almalinux|fedora)
+      if command -v dnf >/dev/null 2>&1; then
+        dnf upgrade -y crowdsec crowdsec-firewall-bouncer-iptables
+      else
+        yum update -y crowdsec crowdsec-firewall-bouncer-iptables
+      fi
+      ;;
+    *)
+      die "Unsupported OS: $os — upgrade manually"
+      ;;
+  esac
+
+  cscli hub update 2>/dev/null
+  cscli hub upgrade 2>/dev/null
+  systemctl restart crowdsec
+  systemctl restart crowdsec-firewall-bouncer
+
+  echo ""
+  echo "Upgraded. Engine: $(cscli version 2>/dev/null | head -1)"
+}
+
+cmd_collections() {
+  require_cscli
+  local subcmd="${1:-list}"
+
+  case "$subcmd" in
+    list)
+      cscli collections list 2>&1
+      ;;
+    available)
+      cscli collections list -a 2>&1
+      ;;
+    install)
+      local name="${2:?Usage: $SCRIPT_NAME collections install <name>}"
+      cscli collections install "$name" 2>&1
+      systemctl reload crowdsec
+      echo "Collection '$name' installed and loaded."
+      ;;
+    remove)
+      local name="${2:?Usage: $SCRIPT_NAME collections remove <name>}"
+      cscli collections remove "$name" 2>&1
+      systemctl reload crowdsec
+      echo "Collection '$name' removed."
+      ;;
+    *)
+      die "Unknown subcommand: $subcmd — use list, available, install, or remove"
+      ;;
+  esac
+}
+
+cmd_whitelist() {
+  require_root
+  require_cscli
+
+  local action="${1:?Usage: $SCRIPT_NAME whitelist <add|remove|list> [ip/cidr]}"
+
+  local wl_file="/etc/crowdsec/parsers/s02-enrich/whitelist-openclaw.yaml"
+
+  case "$action" in
+    list)
+      if [ -f "$wl_file" ]; then
+        echo "=== OpenClaw Whitelist ==="
+        grep -E "^\s+-\s+\"" "$wl_file" 2>/dev/null | sed 's/.*"\(.*\)"/  \1/'
+      else
+        echo "No OpenClaw whitelist configured."
+      fi
+      ;;
+    add)
+      local entry="${2:?Usage: $SCRIPT_NAME whitelist add <ip-or-cidr>}"
+      if [ ! -f "$wl_file" ]; then
+        cat > "$wl_file" <<WLEOF
+name: crowdsecurity/whitelist-openclaw
+description: "OpenClaw managed whitelist"
+whitelist:
+  reason: "whitelisted via openclaw crowdsec-skill"
+  ip:
+    - "127.0.0.1"
+    - "::1"
+WLEOF
+      fi
+      # Check if it's a CIDR or plain IP
+      if echo "$entry" | grep -q "/"; then
+        # Add as CIDR — ensure cidr: section exists
+        if ! grep -q "^  cidr:" "$wl_file"; then
+          echo "  cidr:" >> "$wl_file"
+        fi
+        echo "    - \"$entry\"" >> "$wl_file"
+      else
+        # Add as IP under the ip: section
+        sed -i "/^  ip:/a\\    - \"$entry\"" "$wl_file"
+      fi
+      systemctl reload crowdsec
+      echo "Whitelisted: $entry"
+      ;;
+    remove)
+      local entry="${2:?Usage: $SCRIPT_NAME whitelist remove <ip-or-cidr>}"
+      if [ -f "$wl_file" ]; then
+        grep -v "\"$entry\"" "$wl_file" > "${wl_file}.tmp" && mv "${wl_file}.tmp" "$wl_file"
+        systemctl reload crowdsec
+        echo "Removed from whitelist: $entry"
+      else
+        echo "No whitelist file found."
+      fi
+      ;;
+    *)
+      die "Unknown action: $action — use add, remove, or list"
+      ;;
+  esac
+}
+
+cmd_services() {
+  require_root
+
+  local action="${1:?Usage: $SCRIPT_NAME services <start|stop|restart|health>}"
+
+  case "$action" in
+    start)
+      systemctl start crowdsec && echo "CrowdSec engine: started"
+      systemctl start crowdsec-firewall-bouncer && echo "Firewall bouncer: started"
+      ;;
+    stop)
+      systemctl stop crowdsec-firewall-bouncer && echo "Firewall bouncer: stopped"
+      systemctl stop crowdsec && echo "CrowdSec engine: stopped"
+      ;;
+    restart)
+      systemctl restart crowdsec && echo "CrowdSec engine: restarted"
+      systemctl restart crowdsec-firewall-bouncer && echo "Firewall bouncer: restarted"
+      ;;
+    health)
+      echo "=== Service Health ==="
+      echo "CrowdSec engine:  $(systemctl is-active crowdsec 2>/dev/null || echo inactive)"
+      echo "Firewall bouncer: $(systemctl is-active crowdsec-firewall-bouncer 2>/dev/null || echo inactive)"
+      echo ""
+      echo "=== Bouncer Registration ==="
+      cscli bouncers list 2>&1
+      echo ""
+      echo "=== Collections ==="
+      cscli collections list 2>&1
+      echo ""
+      echo "=== Version ==="
+      cscli version 2>&1
+      ;;
+    *)
+      die "Unknown action: $action — use start, stop, restart, or health"
+      ;;
+  esac
+}
+
 cmd_help() {
   cat <<EOF
 $SCRIPT_NAME v$VERSION — CrowdSec skill for OpenClaw
 
 Usage: $SCRIPT_NAME <command> [options]
 
-Commands:
-  status              Overview: bans, alerts, service health
-  bans [limit]        List active bans (default: 20)
-  alerts [since]      Recent alerts (e.g. 1h, 24h, 7d)
-  metrics             Full CrowdSec metrics
-  ban <ip> [dur] [reason]  Ban an IP (default: 24h)
-  unban <ip>          Remove ban for an IP
-  report [period]     Security summary (e.g. 24h, 7d, 30d)
-  help                This help message
+Monitoring:
+  status                          Overview: bans, alerts, service health
+  bans [limit]                    List active bans (default: 20)
+  alerts [since]                  Recent alerts (e.g. 1h, 24h, 7d)
+  metrics                         Full CrowdSec metrics
+  report [period]                 Security summary (e.g. 24h, 7d, 30d)
+
+Actions:
+  ban <ip> [dur] [reason]         Ban an IP (default: 24h)
+  unban <ip>                      Remove ban for an IP
+
+Install & Manage:
+  install                         Install CrowdSec + bouncer + recommended collections
+  upgrade                         Upgrade CrowdSec and hub content
+  services <start|stop|restart|health>  Manage CrowdSec services
+  collections <list|available|install|remove> [name]  Manage detection collections
+  whitelist <add|remove|list> [ip/cidr]  Manage IP whitelist
+
+Other:
+  help                            This help message
 
 Environment:
-  OUTPUT_FORMAT=json   Output in JSON (status command only)
+  OUTPUT_FORMAT=json              Output in JSON (status command only)
 
 Examples:
+  $SCRIPT_NAME install
   $SCRIPT_NAME status
   $SCRIPT_NAME ban 1.2.3.4 48h "port scanning"
   $SCRIPT_NAME report 7d
-  $SCRIPT_NAME alerts 1h
+  $SCRIPT_NAME whitelist add 10.0.0.0/8
+  $SCRIPT_NAME collections install crowdsecurity/nginx
 EOF
 }
 
 # --- main ---
 
 case "${1:-help}" in
-  status)  cmd_status ;;
-  bans)    cmd_bans "${2:-}" ;;
-  alerts)  cmd_alerts "${2:-}" ;;
-  metrics) cmd_metrics ;;
-  ban)     shift; cmd_ban "$@" ;;
-  unban)   shift; cmd_unban "$@" ;;
-  report)  cmd_report "${2:-}" ;;
+  status)      cmd_status ;;
+  bans)        cmd_bans "${2:-}" ;;
+  alerts)      cmd_alerts "${2:-}" ;;
+  metrics)     cmd_metrics ;;
+  ban)         shift; cmd_ban "$@" ;;
+  unban)       shift; cmd_unban "$@" ;;
+  report)      cmd_report "${2:-}" ;;
+  install)     cmd_install ;;
+  upgrade)     cmd_upgrade ;;
+  collections) shift; cmd_collections "$@" ;;
+  whitelist)   shift; cmd_whitelist "$@" ;;
+  services)    shift; cmd_services "$@" ;;
   help|--help|-h) cmd_help ;;
   version|--version|-v) echo "$SCRIPT_NAME v$VERSION" ;;
-  *)       die "Unknown command: $1 — run '$SCRIPT_NAME help'" ;;
+  *)           die "Unknown command: $1 — run '$SCRIPT_NAME help'" ;;
 esac
