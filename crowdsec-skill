@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+# crowdsec-skill — CrowdSec management for OpenClaw
+# MIT License — Brett Moore (InfraForesight Ltd)
+set -euo pipefail
+
+SCRIPT_NAME="crowdsec-skill"
+VERSION="1.0.0"
+DEFAULT_BAN_DURATION="24h"
+DEFAULT_REPORT_PERIOD="24h"
+DEFAULT_LIMIT="20"
+
+# --- helpers ---
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+require_cscli() {
+  command -v cscli >/dev/null 2>&1 || die "cscli not found — is CrowdSec installed?"
+}
+
+json_output() {
+  if [ "${OUTPUT_FORMAT:-text}" = "json" ]; then
+    return 0
+  fi
+  return 1
+}
+
+# --- commands ---
+
+cmd_status() {
+  require_cscli
+
+  local bans alerts
+  bans=$(cscli decisions list -o json 2>/dev/null | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    if data is None: data = []
+    print(len(data))
+except: print(0)
+" 2>/dev/null || echo "0")
+
+  alerts=$(cscli alerts list -o json 2>/dev/null | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    if data is None: data = []
+    # Count alerts from last hour
+    from datetime import datetime, timedelta, timezone
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+    recent = [a for a in data if datetime.fromisoformat(a.get('created_at','2000-01-01T00:00:00Z').replace('Z','+00:00')) > cutoff]
+    print(len(recent))
+except: print(0)
+" 2>/dev/null || echo "0")
+
+  local bouncer_ok
+  bouncer_ok=$(systemctl is-active crowdsec-firewall-bouncer 2>/dev/null || echo "inactive")
+
+  local crowdsec_ok
+  crowdsec_ok=$(systemctl is-active crowdsec 2>/dev/null || echo "inactive")
+
+  if json_output; then
+    cat <<EOF
+{"active_bans":$bans,"alerts_last_hour":$alerts,"crowdsec":"$crowdsec_ok","bouncer":"$bouncer_ok","version":"$VERSION"}
+EOF
+  else
+    echo "=== CrowdSec Status ==="
+    echo "Engine:          $crowdsec_ok"
+    echo "Firewall bouncer: $bouncer_ok"
+    echo "Active bans:     $bans"
+    echo "Alerts (1h):     $alerts"
+  fi
+}
+
+cmd_bans() {
+  require_cscli
+  local limit="${1:-$DEFAULT_LIMIT}"
+
+  cscli decisions list -o json 2>/dev/null | python3 -c "
+import sys, json
+try:
+    alerts = json.load(sys.stdin)
+    if not alerts:
+        print('No active bans.')
+        sys.exit(0)
+    # Extract decisions from nested alert structure
+    decisions = []
+    for alert in alerts:
+        for d in alert.get('decisions', []) or []:
+            d['_scenario'] = alert.get('scenario', d.get('scenario', ''))
+            d['_source_ip'] = alert.get('source', {}).get('ip', d.get('value', '?'))
+            decisions.append(d)
+    if not decisions:
+        print('No active bans.')
+        sys.exit(0)
+    decisions.sort(key=lambda x: x.get('id', 0), reverse=True)
+    limit = int(sys.argv[1]) if len(sys.argv) > 1 else 20
+    decisions = decisions[:limit]
+    fmt = '{:<18} {:<8} {:<6} {:<12} {}'
+    print(fmt.format('IP', 'Action', 'Origin', 'Expiry', 'Reason'))
+    print('-' * 75)
+    for d in decisions:
+        ip = d.get('value', d.get('_source_ip', '?'))
+        action = d.get('type', '?')
+        origin = d.get('origin', '?')
+        duration = d.get('duration', '?')
+        if isinstance(duration, str):
+            duration = duration.split('.')[0]
+            if len(duration) > 11:
+                duration = duration[:11]
+        scenario = d.get('_scenario', d.get('scenario', ''))
+        if scenario.startswith('crowdsecurity/'):
+            scenario = scenario[14:]
+        print(fmt.format(str(ip)[:17], str(action)[:7], str(origin)[:5], str(duration)[:11], str(scenario)[:40]))
+except Exception as e:
+    print(f'Error: {e}')
+" "$limit" 2>/dev/null
+}
+
+cmd_alerts() {
+  require_cscli
+  local since="${1:-1h}"
+
+  # Convert since to a format cscli understands
+  local since_flag=""
+  case "$since" in
+    *h) since_flag="--since ${since%h}h" ;;
+    *d) since_flag="--since $((${since%d} * 24))h" ;;
+    *)  since_flag="--since 24h" ;;
+  esac
+
+  # shellcheck disable=SC2086
+  cscli alerts list $since_flag -o json 2>/dev/null | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    if not data:
+        print('No alerts in the requested period.')
+        sys.exit(0)
+    fmt = '{:<20} {:<18} {:<8} {}'
+    print(fmt.format('Time', 'Source', 'Events', 'Scenario'))
+    print('-' * 80)
+    for a in data[:30]:
+        ts = a.get('created_at', '?')[:19].replace('T', ' ')
+        source_ip = '?'
+        if a.get('source'):
+            source_ip = a['source'].get('ip', a['source'].get('value', '?'))
+        events = str(a.get('events_count', '?'))
+        scenario = a.get('scenario', '?')
+        # Strip crowdsecurity/ prefix for readability
+        if scenario.startswith('crowdsecurity/'):
+            scenario = scenario[14:]
+        print(fmt.format(ts, str(source_ip)[:17], events, scenario))
+except Exception as e:
+    print(f'Error: {e}')
+" 2>/dev/null
+}
+
+cmd_metrics() {
+  require_cscli
+  cscli metrics 2>&1
+}
+
+cmd_ban() {
+  require_cscli
+  local ip="${1:?Usage: $SCRIPT_NAME ban <ip> [duration] [reason]}"
+  local duration="${2:-$DEFAULT_BAN_DURATION}"
+  local reason="${3:-manual ban via openclaw}"
+
+  # Validate IP format (basic check)
+  if ! echo "$ip" | grep -qE '^[0-9a-fA-F.:]+(/[0-9]+)?$'; then
+    die "Invalid IP address: $ip"
+  fi
+
+  cscli decisions add -i "$ip" -d "$duration" -R "$reason" -t ban 2>&1
+  echo "Banned $ip for $duration — reason: $reason"
+}
+
+cmd_unban() {
+  require_cscli
+  local ip="${1:?Usage: $SCRIPT_NAME unban <ip>}"
+
+  cscli decisions delete -i "$ip" 2>&1
+  echo "Unbanned $ip"
+}
+
+cmd_report() {
+  require_cscli
+  local period="${1:-$DEFAULT_REPORT_PERIOD}"
+
+  local hours
+  case "$period" in
+    *h) hours="${period%h}" ;;
+    *d) hours="$((${period%d} * 24))" ;;
+    *)  hours="24" ;;
+  esac
+
+  local total_bans top_attackers scenarios_hit
+
+  total_bans=$(cscli decisions list -o json 2>/dev/null | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    print(len(data) if data else 0)
+except: print(0)
+" 2>/dev/null || echo "0")
+
+  echo "=== Security Report (last ${period}) ==="
+  echo ""
+  echo "Active bans: $total_bans"
+  echo ""
+
+  echo "--- Top Attackers ---"
+  cscli alerts list --since "${hours}h" -o json 2>/dev/null | python3 -c "
+import sys, json
+from collections import Counter
+try:
+    data = json.load(sys.stdin)
+    if not data:
+        print('No attacks in this period.')
+        sys.exit(0)
+    ips = Counter()
+    scenarios = Counter()
+    for a in data:
+        ip = '?'
+        if a.get('source'):
+            ip = a['source'].get('ip', a['source'].get('value', '?'))
+        ips[ip] += 1
+        s = a.get('scenario', '?')
+        if s.startswith('crowdsecurity/'):
+            s = s[14:]
+        scenarios[s] += 1
+
+    print(f'Total alerts: {len(data)}')
+    print(f'Unique attackers: {len(ips)}')
+    print()
+    for ip, count in ips.most_common(10):
+        print(f'  {ip:<18} {count} alerts')
+    print()
+    print('--- Scenarios Triggered ---')
+    for scenario, count in scenarios.most_common(10):
+        print(f'  {scenario:<30} {count} hits')
+except Exception as e:
+    print(f'Error: {e}')
+" 2>/dev/null
+
+  echo ""
+  echo "--- Bouncer Health ---"
+  local bouncer_status
+  bouncer_status=$(systemctl is-active crowdsec-firewall-bouncer 2>/dev/null || echo "inactive")
+  echo "Firewall bouncer: $bouncer_status"
+
+  local engine_status
+  engine_status=$(systemctl is-active crowdsec 2>/dev/null || echo "inactive")
+  echo "CrowdSec engine:  $engine_status"
+}
+
+cmd_help() {
+  cat <<EOF
+$SCRIPT_NAME v$VERSION — CrowdSec skill for OpenClaw
+
+Usage: $SCRIPT_NAME <command> [options]
+
+Commands:
+  status              Overview: bans, alerts, service health
+  bans [limit]        List active bans (default: 20)
+  alerts [since]      Recent alerts (e.g. 1h, 24h, 7d)
+  metrics             Full CrowdSec metrics
+  ban <ip> [dur] [reason]  Ban an IP (default: 24h)
+  unban <ip>          Remove ban for an IP
+  report [period]     Security summary (e.g. 24h, 7d, 30d)
+  help                This help message
+
+Environment:
+  OUTPUT_FORMAT=json   Output in JSON (status command only)
+
+Examples:
+  $SCRIPT_NAME status
+  $SCRIPT_NAME ban 1.2.3.4 48h "port scanning"
+  $SCRIPT_NAME report 7d
+  $SCRIPT_NAME alerts 1h
+EOF
+}
+
+# --- main ---
+
+case "${1:-help}" in
+  status)  cmd_status ;;
+  bans)    cmd_bans "${2:-}" ;;
+  alerts)  cmd_alerts "${2:-}" ;;
+  metrics) cmd_metrics ;;
+  ban)     shift; cmd_ban "$@" ;;
+  unban)   shift; cmd_unban "$@" ;;
+  report)  cmd_report "${2:-}" ;;
+  help|--help|-h) cmd_help ;;
+  version|--version|-v) echo "$SCRIPT_NAME v$VERSION" ;;
+  *)       die "Unknown command: $1 — run '$SCRIPT_NAME help'" ;;
+esac
