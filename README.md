@@ -1,293 +1,165 @@
 # openclaw-crowdsec-skill
 
-Next-generation security monitoring and management skill for [OpenClaw](https://github.com/anthropics/openclaw).
+CrowdSec Sentinel — security monitoring, intrusion detection, and server hardening skill for [OpenClaw](https://github.com/anthropics/openclaw).
 
-Query active bans, view intrusion alerts, generate security reports, manage firewall rules, and access logs — all from your OpenClaw agents via WhatsApp, CLI, or any supported channel.
+Install, monitor, and manage CrowdSec from your OpenClaw agents via WhatsApp, CLI, or any supported channel. Includes proactive alerting, auth log analysis, firewall management, and security hardening checks.
 
 ## Prerequisites
 
-- [CrowdSec](https://www.crowdsec.net/) installed and running
-- `cscli` available in PATH
-- Python 3 (for JSON formatting and data processing)
-- Root privileges (for firewall and service management)
+- Linux (Debian/Ubuntu or RHEL/CentOS/Fedora)
+- Python 3 (for JSON formatting)
+- Root access (for install/manage commands)
 
-## Why CrowdSec Over Fail2ban?
-
-CrowdSec represents a modern, collaborative approach to intrusion detection that significantly outperforms traditional Fail2ban deployments:
-
-| Feature | CrowdSec | Fail2ban |
-|---------|----------|----------|
-| **Threat Intelligence** | Global community-driven IP reputation database | Local-only, no shared intelligence |
-| **Detection Engine** | Scenario-based with pattern matching & behavioral analysis | Regex-based log parsing only |
-| **Performance** | Optimized C core with efficient event processing | Python-based, can struggle under load |
-| **Scalability** | Built-in API, distributed architecture | Single-server focused |
-| **Bouncer System** | Pluggable enforcement (iptables, nftables, cloud firewalls) | Tied to iptables/nftables directly |
-| **Community Hub** | 500+ pre-built scenarios, parsers, collections | Manual configuration required |
-| **False Positive Reduction** | Community-validated scenarios, IP reputation scoring | Manual tuning required |
-| **Cloud-Native** | Native support for Docker, Kubernetes, cloud firewalls | Primarily designed for bare metal |
-| **Active Development** | Modern codebase, regular security updates | Mature but slower evolution |
-
-### Key Advantages for OpenClaw
-
-1. **Collaborative Defense**: When one CrowdSec user detects an attacker, the entire community benefits. Your OpenClaw agents get protection from threats discovered globally.
-2. **Behavioral Detection**: CrowdSec analyzes patterns over time, catching sophisticated attacks that simple regex matching misses.
-3. **Flexible Enforcement**: The bouncer system means you can ban IPs at the firewall level, cloud provider level, or application level — all from the same detection.
-4. **Lower Maintenance**: Pre-built collections for SSH, web servers, databases, and more mean less time configuring and more time protecting.
-5. **Integrated Logging**: Built-in log commands let OpenClaw agents surface security events directly to users via WhatsApp or other channels.
+CrowdSec itself is **not** required beforehand — `crowdsec-skill install` handles everything.
 
 ## Installation
 
 ### As an OpenClaw skill
 
 ```bash
-cp SKILL.md /path/to/openclaw/skills/crowdsec.md
-cp crowdsec-skill /usr/local/bin/crowdsec-skill
-chmod +x /usr/local/bin/crowdsec-skill
-```
-
-### Standalone
-
-```bash
 git clone https://github.com/Brettmmmmm/openclaw-crowdsec-skill.git
 cd openclaw-crowdsec-skill
 sudo cp crowdsec-skill /usr/local/bin/
+chmod +x /usr/local/bin/crowdsec-skill
+cp SKILL.md /path/to/openclaw/skills/crowdsec.md
 ```
 
-### Quick Install via Skill Command
+### First-time CrowdSec setup
 
 ```bash
 crowdsec-skill install
 ```
 
-This installs CrowdSec engine, firewall bouncer (iptables), and recommended collections.
+This installs CrowdSec engine + firewall bouncer, configures the API key, installs recommended collections (sshd, linux, iptables, linux-lpe), and starts all services.
 
 ## Usage
 
 ### Security Monitoring
 
 ```bash
-# Quick status check
-crowdsec-skill status
+crowdsec-skill status              # Quick health check
+crowdsec-skill bans [limit]        # List banned IPs
+crowdsec-skill alerts [1h|24h|7d]  # Recent intrusion alerts
+crowdsec-skill metrics             # CrowdSec engine metrics
+crowdsec-skill report [24h|7d|30d] # Full security summary
+```
 
-# List active bans
-crowdsec-skill bans
+### Proactive Alerting
 
-# Recent alerts (last hour)
-crowdsec-skill alerts 1h
+```bash
+crowdsec-skill alert               # Check for issues, returns exit codes:
+                                   #   0 = all clear
+                                   #   1 = warning
+                                   #   2 = critical
+```
 
-# Full security report (last 7 days)
-crowdsec-skill report 7d
+### IP Management
 
-# Engine metrics
-crowdsec-skill metrics
+```bash
+crowdsec-skill ban 1.2.3.4 48h "port scanning"
+crowdsec-skill unban 1.2.3.4
+crowdsec-skill whitelist add 10.0.0.0/8
+crowdsec-skill whitelist remove 1.2.3.4
+crowdsec-skill whitelist list
+```
+
+### System Logs
+
+```bash
+crowdsec-skill auth recent         # Recent auth events
+crowdsec-skill auth failed         # Failed login attempts
+crowdsec-skill auth success        # Successful logins
+crowdsec-skill auth sudo           # Sudo usage
+crowdsec-skill auth stats          # Today's auth summary
+
+crowdsec-skill syslog recent       # Recent syslog
+crowdsec-skill syslog errors       # Error entries
+crowdsec-skill syslog kernel       # Kernel/dmesg messages
+crowdsec-skill syslog security     # Security-related events
+
+crowdsec-skill logs recent         # CrowdSec logs
+crowdsec-skill logs errors         # CrowdSec errors
+crowdsec-skill logs watch          # Live tail (Ctrl+C to stop)
+crowdsec-skill logs stats          # Log file statistics
 ```
 
 ### Firewall Management
 
 ```bash
-# View firewall status and rules
-crowdsec-skill firewall status
-
-# Reload firewall rules
-crowdsec-skill firewall reload
-
-# Flush all bans (emergency)
-crowdsec-skill firewall flush
-
-# Switch bouncer type (iptables <-> ufw)
-crowdsec-skill firewall switch ufw
+crowdsec-skill firewall status     # Show firewall state + ipset counts
+crowdsec-skill firewall reload     # Reload bouncer
+crowdsec-skill firewall flush      # Clear all bans
+crowdsec-skill firewall switch ufw # Switch bouncer type
 ```
 
-### Log Access (OpenClaw Integration)
+### Log Rotation & Retention
 
 ```bash
-# Recent logs (last 20 lines)
-crowdsec-skill logs recent
-
-# Error logs only
-crowdsec-skill logs errors
-
-# Log statistics
-crowdsec-skill logs stats
-
-# Watch live logs (for interactive sessions)
-crowdsec-skill logs watch
+crowdsec-skill logging status      # Current config
+crowdsec-skill logging setup       # Configure logrotate
+crowdsec-skill logging retention 30 # Set retention (days)
+crowdsec-skill logging report 7d   # Log analysis report
+crowdsec-skill logging rotate      # Force rotation now
 ```
 
-### Manual Actions
+### Install & Manage
 
 ```bash
-# Ban an IP for 48 hours
-crowdsec-skill ban 1.2.3.4 48h "port scanning"
-
-# Unban an IP
-crowdsec-skill unban 1.2.3.4
-
-# Whitelist trusted IP/network
-crowdsec-skill whitelist add 10.0.0.0/8
-```
-
-### Service Management
-
-```bash
-# Full health check
-crowdsec-skill services health
-
-# Restart services
-crowdsec-skill services restart
-```
-
-### Collections Management
-
-```bash
-# List installed collections
-crowdsec-skill collections list
-
-# Install nginx protection
+crowdsec-skill install             # Full install from scratch
+crowdsec-skill upgrade             # Upgrade packages + hub
+crowdsec-skill services health     # Full health check
+crowdsec-skill services restart    # Restart engine + bouncer
+crowdsec-skill collections list    # Show installed collections
+crowdsec-skill collections available # Show all available
 crowdsec-skill collections install crowdsecurity/nginx
+```
+
+### Security Hardening
+
+```bash
+crowdsec-skill hardening           # Check SSH config, firewall,
+                                   # permissions, update status
+```
+
+### Why CrowdSec?
+
+```bash
+crowdsec-skill compare             # CrowdSec vs Fail2ban explained
 ```
 
 ## OpenClaw Agent Integration
 
-The skill is designed for these agent personas:
-
-| Agent | Use Case | Commands |
-|-------|----------|----------|
-| **Pulse** (monitor) | Automated security checks, alert delivery via WhatsApp | `status`, `alerts`, `report`, `logs errors` |
-| **Atlas** (infra) | Manual ban/unban, incident response, firewall management | `ban`, `unban`, `firewall`, `services` |
-| **Jarvis** (orchestrator) | On-demand security status, executive summaries | `status`, `metrics`, `compare`, `report` |
-
-### Example: WhatsApp voice command
-
-> "Jarvis, are we under attack?"
-
-Jarvis routes to Pulse, which runs `crowdsec-skill status` and delivers the result.
+| Agent | Use Case |
+|-------|----------|
+| **Pulse** (monitor) | Automated security checks, alert delivery via WhatsApp |
+| **Atlas** (infra) | Manual ban/unban, incident response, hardening |
+| **Jarvis** (orchestrator) | On-demand security status |
 
 ### Example: Cron-based daily digest
 
 ```bash
-# Daily security digest (08:00)
-0 8 * * * openclaw agent --agent pulse \
-  -m "Run crowdsec-skill report --period 24h" \
+openclaw agent --agent pulse \
+  -m "Run crowdsec-skill report --period 24h and send me the summary" \
   --deliver --reply-channel whatsapp \
-  --reply-to <user-number>
-
-# Hourly status check
-0 * * * * openclaw agent --agent pulse \
-  -m "Run crowdsec-skill status" \
-  --deliver --reply-channel whatsapp \
-  --reply-to <user-number>
+  --reply-to 447480265496@s.whatsapp.net
 ```
 
-### Example: Alert on errors
+### Example: Proactive alerting in a cron job
 
 ```bash
-# Check for errors every 15 minutes
-*/15 * * * * openclaw agent --agent pulse \
-  -m "Run crowdsec-skill logs errors" \
+crowdsec-skill alert || openclaw agent --agent pulse \
+  -m "Security alert triggered — run crowdsec-skill alert and send the output" \
   --deliver --reply-channel whatsapp \
-  --reply-to <user-number>
+  --reply-to 447480265496@s.whatsapp.net
 ```
 
 ## JSON Output
 
-Set `OUTPUT_FORMAT=json` for machine-readable output (supported on `status` command):
-
 ```bash
 OUTPUT_FORMAT=json crowdsec-skill status
+# {"active_bans":100,"alerts_last_hour":50,"crowdsec":"active","bouncer":"active","version":"1.5.0"}
 ```
-
-Response:
-```json
-{"active_bans":5,"alerts_last_hour":12,"crowdsec":"active","bouncer":"active","version":"1.3.0"}
-```
-
-## Firewall Configuration
-
-### iptables (Default)
-
-The skill uses iptables by default. Rules are added to a dedicated `crowdsec` chain:
-
-```bash
-crowdsec-skill firewall status
-```
-
-Shows active ban rules with line numbers.
-
-### UFW Alternative
-
-For systems using UFW:
-
-```bash
-crowdsec-skill firewall switch ufw
-```
-
-Ensure UFW is enabled:
-```bash
-ufw enable
-```
-
-### Whitelist Configuration
-
-OpenClaw-managed whitelist location:
-`/etc/crowdsec/parsers/s02-enrich/whitelist-openclaw.yaml`
-
-Always whitelist:
-- OpenClaw agent IPs
-- Monitoring system IPs
-- Trusted admin networks
-
-## Comparison: Real-World Impact
-
-### Fail2ban Approach
-```
-Attacker probes SSH → Log entry written → Fail2ban parses log → Regex matches → IP banned
-```
-- Detection happens AFTER successful log entry
-- Only protects this server
-- Attacker can probe other servers freely
-
-### CrowdSec Approach
-```
-Attacker probes SSH → Pattern detected → IP checked against global reputation → 
-  → If known bad: instant ban + community alert
-  → If new: behavioral analysis → ban + share with community
-```
-- Detection can happen BEFORE successful authentication
-- Protection shared across 50,000+ community members
-- Attacker's IP becomes toxic across the entire network
-
-## Architecture
-
-See [ARCHITECTURE.md](./ARCHITECTURE.md) for detailed system architecture, data flows, and integration points.
-
-## Recommended Collections
-
-| Collection | Purpose | Priority |
-|------------|---------|----------|
-| `crowdsecurity/sshd` | SSH brute-force detection | Critical |
-| `crowdsecurity/linux` | Base Linux security scenarios | Critical |
-| `crowdsecurity/iptables` | Firewall integration | Critical |
-| `crowdsecurity/linux-lpe` | Local privilege escalation | High |
-| `crowdsecurity/nginx` | Web server protection | Medium |
-| `crowdsecurity/apache2` | Apache protection | Medium |
-| `crowdsecurity/docker` | Docker daemon protection | Medium |
-| `crowdsecurity/postfix` | Mail server protection | Low |
-
-## Troubleshooting
-
-| Issue | Resolution |
-|-------|------------|
-| `cscli not found` | Run `crowdsec-skill install` |
-| No bans showing | Check scenarios with `crowdsec-skill collections list` |
-| Service inactive | Run `crowdsec-skill services restart` |
-| Firewall not blocking | Check bouncer with `crowdsec-skill firewall status` |
-| No logs found | Check journald: `journalctl -u crowdsec` |
 
 ## License
 
-MIT
-
-## Author
-
-Brett Moore (InfraForesight Ltd)
+MIT — Brett Moore / InfraForesight Ltd

@@ -515,16 +515,28 @@ cmd_firewall() {
       echo "Bouncer type: $bouncer_type"
       echo ""
       if [ "$bouncer_type" = "iptables" ]; then
-        echo "--- iptables crowdsec chain ---"
-        iptables -L crowdsec -n --line-numbers 2>/dev/null || echo "Chain not found"
+        # CrowdSec uses ipset for bans, check both chain and ipset
+        echo "--- iptables CrowdSec rules ---"
+        iptables -L INPUT -n --line-numbers 2>/dev/null | grep -i "crowdsec\|match-set" || echo "No iptables rules (may use ipset directly)"
         echo ""
-        echo "--- Rules count ---"
-        local count
-        count=$(iptables -L crowdsec -n 2>/dev/null | grep -c "^" || echo "2")
-        if [ "$count" -gt 2 ] 2>/dev/null; then
-          echo "Active rules: $((count - 2))"
+        echo "--- ipset blocklists ---"
+        if command -v ipset >/dev/null 2>&1; then
+          local ipv4_count=0 ipv6_count=0 setname
+          # CrowdSec may use suffixed names (crowdsec-blacklists-0, -1, etc.)
+          for setname in $(ipset list -n 2>/dev/null | grep "crowdsec-blacklists"); do
+            local entries
+            entries=$(ipset list "$setname" 2>/dev/null | grep "^Number of entries:" | awk '{print $NF}')
+            ipv4_count=$((ipv4_count + ${entries:-0}))
+          done
+          for setname in $(ipset list -n 2>/dev/null | grep "crowdsec6-blacklists"); do
+            local entries
+            entries=$(ipset list "$setname" 2>/dev/null | grep "^Number of entries:" | awk '{print $NF}')
+            ipv6_count=$((ipv6_count + ${entries:-0}))
+          done
+          echo "IPv4 blocked: $ipv4_count"
+          echo "IPv6 blocked: $ipv6_count"
         else
-          echo "Active rules: 0"
+          echo "ipset not available"
         fi
       elif [ "$bouncer_type" = "ufw" ]; then
         echo "--- UFW Rules ---"
@@ -538,7 +550,7 @@ cmd_firewall() {
       ;;
     flush)
       echo "Flushing all CrowdSec bans..."
-      cscli decisions delete -a
+      cscli decisions delete --all 2>&1
       if [ "$bouncer_type" = "iptables" ]; then
         iptables -F crowdsec 2>/dev/null || true
       fi
@@ -634,7 +646,7 @@ cmd_auth() {
       echo "=== Failed Login Attempts ==="
       local count=0
       if [ -f "$AUTH_LOG" ]; then
-        count=$(grep -ci "failed\|failure\|invalid" "$AUTH_LOG" 2>/dev/null | tail -1 || echo "0")
+        count=$(grep -ciE "failed|failure|invalid" "$AUTH_LOG" 2>/dev/null || echo "0")
         echo "Total failed attempts in log: $count"
         echo ""
         echo "Last $lines failures:"
@@ -666,14 +678,19 @@ cmd_auth() {
         echo "Size: $(du -h "$AUTH_LOG" | cut -f1)"
         echo ""
         echo "Today's activity:"
-        local today
-        today=$(date +%Y-%m-%d)
-        echo "  Failed logins: $(grep -c "$(date +%b.*$today).*[Ff]ailed" "$AUTH_LOG" 2>/dev/null || echo "0")"
-        echo "  Successful: $(grep -c "$(date +%b.*$today).*[Aa]ccepted" "$AUTH_LOG" 2>/dev/null || echo "0")"
-        echo "  Sudo commands: $(grep -c "$(date +%b.*$today).*sudo:" "$AUTH_LOG" 2>/dev/null || echo "0")"
+        local today_iso today_syslog
+        today_iso=$(date +%Y-%m-%d)
+        today_syslog=$(date +"%b %_d")
+        local failed_count success_count sudo_count
+        failed_count=$(grep -E "$today_iso|$today_syslog" "$AUTH_LOG" 2>/dev/null | grep -ciE "failed|failure" || true)
+        success_count=$(grep -E "$today_iso|$today_syslog" "$AUTH_LOG" 2>/dev/null | grep -ci "accepted" || true)
+        sudo_count=$(grep -E "$today_iso|$today_syslog" "$AUTH_LOG" 2>/dev/null | grep -ci "sudo:" || true)
+        echo "  Failed logins: ${failed_count:-0}"
+        echo "  Successful: ${success_count:-0}"
+        echo "  Sudo commands: ${sudo_count:-0}"
       else
         echo "Using journald"
-        echo "  SSH events today: $(journalctl -t sshd --since today --no-pager | wc -l)"
+        echo "  SSH events today: $(journalctl -t sshd --since today --no-pager 2>/dev/null | wc -l)"
       fi
       ;;
     *)
@@ -774,9 +791,14 @@ except: print(0)
 
   # Check failed logins
   if [ -f "$AUTH_LOG" ]; then
-    failed_logins=$(grep -c "$(date +%b.*$(date +%d)).*[Ff]ailed" "$AUTH_LOG" 2>/dev/null || echo "0")
+    local today_iso today_syslog
+    today_iso=$(date +%Y-%m-%d)
+    today_syslog=$(date +"%b %_d")
+    failed_logins=$(grep -E "$today_iso|$today_syslog" "$AUTH_LOG" 2>/dev/null | grep -ciE "failed|failure" || true)
+    failed_logins="${failed_logins:-0}"
   else
-    failed_logins=$(journalctl -t sshd --since today --no-pager | grep -ci "failed" || echo "0")
+    failed_logins=$(journalctl -t sshd --since today --no-pager 2>/dev/null | grep -ci "failed" || true)
+    failed_logins="${failed_logins:-0}"
   fi
 
   if [ "$failed_logins" -ge "$FAILED_LOGIN_CRIT" ]; then
@@ -845,21 +867,29 @@ cmd_hardening() {
   # Check SSH configuration
   echo "--- SSH Configuration ---"
   if [ -f /etc/ssh/sshd_config ]; then
-    if grep -q "^PermitRootLogin yes" /etc/ssh/sshd_config 2>/dev/null; then
+    # Check effective SSH settings (include drop-in configs)
+    local sshd_effective
+    sshd_effective=$(sshd -T 2>/dev/null || cat /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null)
+
+    if echo "$sshd_effective" | grep -qi "^permitrootlogin yes"; then
       echo "⚠️  Root login permitted via SSH"
       issues=$((issues + 1))
+    elif echo "$sshd_effective" | grep -qi "^permitrootlogin prohibit-password"; then
+      echo "✓ Root login: key-only (prohibit-password)"
+    elif echo "$sshd_effective" | grep -qi "^permitrootlogin no"; then
+      echo "✓ Root login: disabled"
     else
-      echo "✓ Root login disabled"
+      echo "ℹ️  Root login: using default (prohibit-password)"
     fi
 
-    if grep -q "^PasswordAuthentication yes" /etc/ssh/sshd_config 2>/dev/null; then
+    if echo "$sshd_effective" | grep -qi "^passwordauthentication yes"; then
       echo "⚠️  Password authentication enabled (consider key-only)"
       issues=$((issues + 1))
     else
       echo "✓ Password authentication disabled"
     fi
 
-    if grep -q "^PermitEmptyPasswords yes" /etc/ssh/sshd_config 2>/dev/null; then
+    if echo "$sshd_effective" | grep -qi "^permitemptypasswords yes"; then
       echo "🚨 Empty passwords permitted!"
       issues=$((issues + 2))
     else
@@ -1141,7 +1171,7 @@ Key Advantages:
 
 3. PERFORMANCE & SCALABILITY
    - Fail2ban: Python-based, struggles under high load
-   - CrowdSec: C-based core, efficient event processing
+   - CrowdSec: Go-based engine, efficient concurrent processing
    - Impact: Handles DDoS and brute-force attacks without lag
 
 4. CLOUD-NATIVE ARCHITECTURE
