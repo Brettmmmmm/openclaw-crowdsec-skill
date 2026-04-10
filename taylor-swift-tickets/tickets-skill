@@ -150,7 +150,7 @@ CONF
 
     info "Sending alert to ${line} ..."
     openclaw agent \
-      --agent pulse \
+      --agent tickets \
       -m "$msg" \
       --deliver \
       --reply-channel whatsapp \
