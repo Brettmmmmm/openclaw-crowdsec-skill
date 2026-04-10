@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# tickets-skill — Taylor Swift UK Ticket Monitor for OpenClaw
+# Runs a Dockerised Playwright browser to check UK ticketing sites.
+#
+# MONITORING ONLY — does not purchase tickets.
+# UK Digital Economy Act 2017: automated purchasing for resale is illegal.
+#
+# MIT License — Brett Moore (InfraForesight Ltd)
+set -euo pipefail
+
+SCRIPT_NAME="tickets-skill"
+VERSION="1.0.0"
+IMAGE_NAME="openclaw-tickets-monitor"
+SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCREENSHOT_DIR="${OPENCLAW_TICKETS_SCREENSHOTS:-/tmp/ticket-screenshots}"
+DEFAULT_INTERVAL=300  # seconds (5 minutes)
+
+# --- helpers ---
+
+die()  { echo "ERROR: $*" >&2; exit 1; }
+info() { echo "[${SCRIPT_NAME}] $*"; }
+warn() { echo "WARNING: $*" >&2; }
+
+require_docker() {
+  command -v docker >/dev/null 2>&1 || die "Docker not found — install Docker first"
+  docker info >/dev/null 2>&1      || die "Docker daemon is not running"
+}
+
+image_exists() {
+  docker image inspect "$IMAGE_NAME" >/dev/null 2>&1
+}
+
+parse_interval() {
+  # Converts 5m / 10m / 1h / 300 to seconds
+  local raw="$1"
+  if   [[ "$raw" =~ ^([0-9]+)m$ ]]; then echo $(( ${BASH_REMATCH[1]} * 60 ))
+  elif [[ "$raw" =~ ^([0-9]+)h$ ]]; then echo $(( ${BASH_REMATCH[1]} * 3600 ))
+  elif [[ "$raw" =~ ^[0-9]+$    ]]; then echo "$raw"
+  else die "Invalid interval '$raw' — use e.g. 5m, 10m, 1h, or seconds"
+  fi
+}
+
+# --- commands ---
+
+cmd_setup() {
+  require_docker
+  info "Building Docker image '$IMAGE_NAME' (first run only, ~500 MB)..."
+  docker build -t "$IMAGE_NAME" "$SKILL_DIR"
+  info "Done. Run '$SCRIPT_NAME check' to test."
+}
+
+cmd_check() {
+  local sites="all"
+  local json_flag=""
+  local screenshot_flag=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --sites)       sites="$2"; shift ;;
+      --json)        json_flag="--json" ;;
+      --screenshots) screenshot_flag="--screenshots /screenshots"
+                     mkdir -p "$SCREENSHOT_DIR" ;;
+      *)             warn "Unknown flag: $1" ;;
+    esac
+    shift
+  done
+
+  require_docker
+  image_exists || die "Image not built — run '$SCRIPT_NAME setup' first"
+
+  local vol_args=()
+  if [[ -n "$screenshot_flag" ]]; then
+    vol_args=(-v "${SCREENSHOT_DIR}:/screenshots")
+  fi
+
+  docker run --rm -i \
+    "${vol_args[@]+"${vol_args[@]}"}" \
+    "$IMAGE_NAME" \
+    --sites "$sites" \
+    --verbose \
+    ${json_flag} \
+    ${screenshot_flag}
+}
+
+cmd_watch() {
+  local interval="${1:-5m}"
+  local sites="${2:-all}"
+  local secs
+  secs=$(parse_interval "$interval")
+
+  require_docker
+  image_exists || die "Image not built — run '$SCRIPT_NAME setup' first"
+
+  info "Watching for Taylor Swift UK tickets every ${interval} (Ctrl+C to stop)"
+  info "Sites: $sites"
+
+  while true; do
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    info "Checking at $ts..."
+
+    local output exit_code=0
+    output=$(cmd_check --sites "$sites" 2>&1) || exit_code=$?
+
+    echo "$output"
+
+    if echo "$output" | grep -q "TICKETS AVAILABLE"; then
+      info "*** ALERT: Tickets found! Check the links above. ***"
+      # OpenClaw notification hook — fires if openclaw-notify is in PATH
+      if command -v openclaw-notify >/dev/null 2>&1; then
+        openclaw-notify "Taylor Swift UK tickets may be available! Check ticketing sites now."
+      fi
+    fi
+
+    sleep "$secs"
+  done
+}
+
+cmd_screenshot() {
+  local site="${1:-all}"
+  mkdir -p "$SCREENSHOT_DIR"
+  info "Taking screenshots (saved to $SCREENSHOT_DIR)..."
+  cmd_check --sites "$site" --screenshots
+  info "Screenshots:"
+  ls -lh "${SCREENSHOT_DIR}"/*.png 2>/dev/null || info "  (none saved)"
+}
+
+cmd_sites() {
+  require_docker
+  image_exists || die "Image not built — run '$SCRIPT_NAME setup' first"
+  docker run --rm "$IMAGE_NAME" --list-sites
+}
+
+cmd_status() {
+  echo "=== Ticket Monitor Status ==="
+  echo "Version  : $VERSION"
+  echo "Image    : $IMAGE_NAME"
+  if image_exists; then
+    local size
+    size=$(docker image inspect "$IMAGE_NAME" --format='{{.Size}}' \
+           | numfmt --to=iec-i --suffix=B 2>/dev/null || echo "unknown size")
+    echo "Image    : built ($size)"
+  else
+    echo "Image    : NOT BUILT — run '$SCRIPT_NAME setup'"
+  fi
+  echo "Interval : ${DEFAULT_INTERVAL}s default"
+  echo "Screenshots : $SCREENSHOT_DIR"
+  echo "Docker   : $(docker --version 2>/dev/null || echo 'not found')"
+}
+
+cmd_help() {
+  cat <<EOF
+Taylor Swift UK Ticket Monitor — OpenClaw Skill v${VERSION}
+
+MONITORING ONLY. Does not purchase tickets.
+UK Digital Economy Act 2017 prohibits automated purchasing for resale.
+
+USAGE:
+  ${SCRIPT_NAME} <command> [options]
+
+COMMANDS:
+  setup                    Build the Docker browser image (once)
+  check [options]          One-shot availability check
+  watch [interval] [sites] Continuous polling with alerts
+  screenshot [site]        Check + save browser screenshots
+  sites                    List available ticketing site IDs
+  status                   Show image and configuration info
+  help                     This help text
+
+OPTIONS (check / watch):
+  --sites <ids>   Comma-separated site IDs, or 'all' (default)
+  --json          Machine-readable JSON output
+  --screenshots   Save browser screenshots to \$SCREENSHOT_DIR
+
+INTERVAL FORMAT (watch):
+  5m, 10m, 1h, or raw seconds  (default: 5m)
+
+SITES:
+  ticketmaster   Ticketmaster UK
+  seetickets     See Tickets
+  gigsandtours   Gigsandtours
+  livenation     Live Nation UK
+  axs            AXS UK
+
+EXAMPLES:
+  ${SCRIPT_NAME} setup
+  ${SCRIPT_NAME} check
+  ${SCRIPT_NAME} check --sites ticketmaster,seetickets --screenshots
+  ${SCRIPT_NAME} watch 5m
+  ${SCRIPT_NAME} watch 10m ticketmaster,axs
+  ${SCRIPT_NAME} screenshot ticketmaster
+
+ENVIRONMENT:
+  OPENCLAW_TICKETS_SCREENSHOTS   Screenshot directory (default: /tmp/ticket-screenshots)
+
+CRON EXAMPLE:
+  */5 * * * * ${SCRIPT_NAME} check --json | grep -q '"available_count": [^0]' && \\
+    openclaw-notify "Taylor Swift tickets available!"
+EOF
+}
+
+# --- main dispatch ---
+
+CMD="${1:-help}"
+shift || true
+
+case "$CMD" in
+  setup)      cmd_setup ;;
+  check)      cmd_check "$@" ;;
+  watch)      cmd_watch "$@" ;;
+  screenshot) cmd_screenshot "$@" ;;
+  sites)      cmd_sites ;;
+  status)     cmd_status ;;
+  help|--help|-h) cmd_help ;;
+  *) die "Unknown command: '$CMD' — run '$SCRIPT_NAME help'" ;;
+esac

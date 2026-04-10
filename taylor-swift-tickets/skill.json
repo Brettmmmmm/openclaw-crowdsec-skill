@@ -1,0 +1,13 @@
+{
+  "name": "taylor-swift-tickets",
+  "version": "1.0.0",
+  "description": "Taylor Swift UK Ticket Monitor: Uses a Dockerised Playwright browser to check Ticketmaster, See Tickets, Gigsandtours, Live Nation, and AXS for ticket availability. Monitoring only — not purchasing. Alerts via OpenClaw when tickets go on sale.",
+  "author": "Brett Moore (InfraForesight Ltd)",
+  "tags": ["tickets", "taylor-swift", "monitoring", "playwright", "docker", "browser", "ticketmaster", "uk", "alerts"],
+  "repository": "https://github.com/Brettmmmmm/openclaw-crowdsec-skill",
+  "license": "MIT",
+  "clawhub_category": "lifestyle-monitoring",
+  "requires": ["docker"],
+  "docker_image": "openclaw-tickets-monitor",
+  "entry_point": "tickets-skill"
+}
