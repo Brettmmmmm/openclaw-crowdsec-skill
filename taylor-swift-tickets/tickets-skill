@@ -13,6 +13,9 @@ VERSION="1.0.0"
 IMAGE_NAME="openclaw-tickets-monitor"
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCREENSHOT_DIR="${OPENCLAW_TICKETS_SCREENSHOTS:-/tmp/ticket-screenshots}"
+NOTIFY_CONF="${SKILL_DIR}/notify.conf"
+LOG_DIR="/var/log/openclaw"
+LOG_FILE="${LOG_DIR}/tickets.log"
 DEFAULT_INTERVAL=300  # seconds (5 minutes)
 
 # --- helpers ---
@@ -106,10 +109,7 @@ cmd_watch() {
 
     if echo "$output" | grep -q "TICKETS AVAILABLE"; then
       info "*** ALERT: Tickets found! Check the links above. ***"
-      # OpenClaw notification hook — fires if openclaw-notify is in PATH
-      if command -v openclaw-notify >/dev/null 2>&1; then
-        openclaw-notify "Taylor Swift UK tickets may be available! Check ticketing sites now."
-      fi
+      cmd_notify "Taylor Swift UK tickets may be available! Check ticketing sites NOW."
     fi
 
     sleep "$secs"
@@ -123,6 +123,42 @@ cmd_screenshot() {
   cmd_check --sites "$site" --screenshots
   info "Screenshots:"
   ls -lh "${SCREENSHOT_DIR}"/*.png 2>/dev/null || info "  (none saved)"
+}
+
+cmd_notify() {
+  local msg="${1:-Taylor Swift UK tickets alert!}"
+
+  # Load WhatsApp numbers from notify.conf (one per line, E.164+JID format)
+  if [[ ! -f "$NOTIFY_CONF" ]]; then
+    warn "No notify.conf found — creating default at $NOTIFY_CONF"
+    cat > "$NOTIFY_CONF" <<'CONF'
+# Taylor Swift Ticket Monitor — WhatsApp notification list
+# One number per line in E.164+JID format, e.g.:
+#   447480265496@s.whatsapp.net
+# Lines starting with # are ignored.
+
+447480265496@s.whatsapp.net
+CONF
+    info "Edit $NOTIFY_CONF to add more numbers."
+  fi
+
+  local count=0
+  while IFS= read -r line; do
+    line="${line%%#*}"          # strip inline comments
+    line="${line// /}"          # strip whitespace
+    [[ -z "$line" ]] && continue
+
+    info "Sending alert to ${line} ..."
+    openclaw agent \
+      --agent pulse \
+      -m "$msg" \
+      --deliver \
+      --reply-channel whatsapp \
+      --reply-to "$line" 2>&1 || warn "Failed to notify $line"
+    (( count++ )) || true
+  done < "$NOTIFY_CONF"
+
+  info "Notified $count recipient(s)."
 }
 
 cmd_sites() {
@@ -162,6 +198,7 @@ COMMANDS:
   setup                    Build the Docker browser image (once)
   check [options]          One-shot availability check
   watch [interval] [sites] Continuous polling with alerts
+  notify [message]         Send a test WhatsApp alert to all recipients
   screenshot [site]        Check + save browser screenshots
   sites                    List available ticketing site IDs
   status                   Show image and configuration info
@@ -208,6 +245,7 @@ case "$CMD" in
   setup)      cmd_setup ;;
   check)      cmd_check "$@" ;;
   watch)      cmd_watch "$@" ;;
+  notify)     cmd_notify "$*" ;;
   screenshot) cmd_screenshot "$@" ;;
   sites)      cmd_sites ;;
   status)     cmd_status ;;
