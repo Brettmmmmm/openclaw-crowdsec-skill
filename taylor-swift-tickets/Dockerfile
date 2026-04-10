@@ -1,4 +1,6 @@
-FROM python:3.11-slim
+# Pinned to Bookworm (Debian 12) — Playwright's --with-deps fails on Trixie (Debian 13)
+# due to missing ttf-unifont / ttf-ubuntu-font-family packages in that release.
+FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 
