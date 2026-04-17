@@ -1,11 +1,13 @@
 {
-  "name": "crowdsec-sentinel",
-  "version": "1.5.0",
-  "description": "CrowdSec Sentinel: Comprehensive security monitoring for OpenClaw. CrowdSec intrusion detection, proactive alerting, auth/syslog monitoring, security hardening, firewall management (iptables/UFW), and professional log management with rotation, retention, and reporting. Superior to Fail2ban.",
+  "name": "taylor-swift-tickets",
+  "version": "1.0.0",
+  "description": "Taylor Swift UK Ticket Monitor: Uses a Dockerised Playwright browser to check Ticketmaster, See Tickets, Gigsandtours, Live Nation, and AXS for ticket availability. Monitoring only — not purchasing. Alerts via OpenClaw when tickets go on sale.",
   "author": "Brett Moore (InfraForesight Ltd)",
-  "tags": ["security", "crowdsec", "firewall", "monitoring", "ssh", "intrusion-detection", "fail2ban-alternative", "iptables", "ufw", "logging", "logrotate", "hardening", "sentinel"],
+  "tags": ["tickets", "taylor-swift", "monitoring", "playwright", "docker", "browser", "ticketmaster", "uk", "alerts"],
   "repository": "https://github.com/Brettmmmmm/openclaw-crowdsec-skill",
   "license": "MIT",
-  "clawhub_category": "security-monitoring",
-  "clawhub_featured": true
+  "clawhub_category": "lifestyle-monitoring",
+  "requires": ["docker"],
+  "docker_image": "openclaw-tickets-monitor",
+  "entry_point": "tickets-skill"
 }

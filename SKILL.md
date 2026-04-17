@@ -1,198 +1,123 @@
 ---
-name: crowdsec
+name: taylor-swift-tickets
 description: |
-  CrowdSec Sentinel — install, monitor, and manage CrowdSec intrusion
-  detection for OpenClaw agents. Includes proactive alerting, auth log
-  analysis, firewall management, and security hardening checks.
-  Designed for Pulse (monitoring) and Atlas (infra) personas.
+  Taylor Swift UK Ticket Monitor — uses a Dockerised Playwright browser
+  to check Ticketmaster, See Tickets, Gigsandtours, Live Nation, and AXS
+  for ticket availability. Monitoring only, not purchasing.
+  Alerts via OpenClaw when tickets go on sale.
 triggers:
-  - "security status"
-  - "show bans"
-  - "ban ip"
-  - "unban ip"
-  - "crowdsec"
-  - "who is attacking"
-  - "security report"
-  - "intrusion"
-  - "blocked ips"
-  - "install crowdsec"
-  - "upgrade crowdsec"
-  - "whitelist ip"
-  - "crowdsec collections"
-  - "failed logins"
-  - "auth log"
-  - "hardening"
-  - "firewall status"
-  - "security alert"
+  - "taylor swift tickets"
+  - "check tickets"
+  - "ticket availability"
+  - "taylor swift uk"
+  - "when do tickets go on sale"
+  - "watch for tickets"
+  - "ticket alert"
+  - "monitor tickets"
+  - "any tickets available"
+  - "ticketmaster taylor swift"
+  - "set up ticket monitor"
 ---
 
-# CrowdSec Sentinel Skill
+# Taylor Swift UK Ticket Monitor Skill
 
-Install, monitor, and manage CrowdSec intrusion detection from any OpenClaw agent.
+Monitors UK ticketing sites for Taylor Swift ticket availability using a real browser running in Docker (Playwright + Chromium).
 
-## Commands
+**Legal notice:** This skill monitors availability only. It does not automate purchases or assist with resale. Automated ticket purchasing for resale is an offence under the UK Digital Economy Act 2017.
 
-### Install & Upgrade
-Trigger: "install crowdsec", "set up crowdsec", "upgrade crowdsec"
+## Setup (run once)
+
+Trigger: "set up ticket monitor", "build ticket checker"
 
 ```bash
-crowdsec-skill install    # Full install: engine + bouncer + collections
-crowdsec-skill upgrade    # Upgrade packages and hub content
+tickets-skill setup
 ```
 
-### Status Overview
-Trigger: "security status", "crowdsec status", "are we under attack"
+Builds the Playwright Docker image with Chromium (~500 MB, one-time).
+
+## One-Shot Check
+
+Trigger: "check taylor swift tickets", "any tickets available"
 
 ```bash
-crowdsec-skill status
+tickets-skill check
+tickets-skill check --sites ticketmaster,seetickets
+tickets-skill check --json
 ```
 
-### List Active Bans
-Trigger: "show bans", "blocked ips", "who is banned"
+Returns exit 0 if tickets found, exit 1 if none.
+
+## Continuous Monitoring
+
+Trigger: "watch for tickets", "monitor tickets every 5 minutes"
 
 ```bash
-crowdsec-skill bans [limit]
+tickets-skill watch 5m
+tickets-skill watch 10m ticketmaster,axs
+tickets-skill watch 5m all
 ```
 
-### Recent Alerts
-Trigger: "recent attacks", "security alerts", "who is attacking"
+Polls on the given interval and fires `openclaw-notify` if tickets appear.
+
+## Screenshots
+
+Trigger: "screenshot the ticket site", "show me the ticketmaster page"
 
 ```bash
-crowdsec-skill alerts [1h|24h|7d]
+tickets-skill screenshot
+tickets-skill screenshot ticketmaster
 ```
 
-### Security Report
-Trigger: "security report", "daily security summary"
+Saves browser screenshots to `/tmp/ticket-screenshots/` for verification.
+
+## Available Sites
+
+| ID | Site |
+|----|------|
+| `ticketmaster` | Ticketmaster UK |
+| `seetickets` | See Tickets |
+| `gigsandtours` | Gigsandtours |
+| `livenation` | Live Nation UK |
+| `axs` | AXS UK |
 
 ```bash
-crowdsec-skill report [24h|7d|30d]
-```
-
-### Proactive Alert Check
-Trigger: "security alert", "check security", "run alert check"
-
-```bash
-crowdsec-skill alert
-```
-
-Returns exit code 0 (clear), 1 (warning), or 2 (critical) for automation.
-Checks: ban count, alert rate, failed logins, service health.
-
-### Ban / Unban
-Trigger: "ban ip X.X.X.X", "block ip", "unban ip"
-
-```bash
-crowdsec-skill ban <ip> [duration] [reason]
-crowdsec-skill unban <ip>
-```
-
-### Auth Logs
-Trigger: "failed logins", "auth log", "who logged in", "sudo usage"
-
-```bash
-crowdsec-skill auth recent         # Recent auth events
-crowdsec-skill auth failed         # Failed login attempts
-crowdsec-skill auth success        # Successful logins
-crowdsec-skill auth sudo           # Sudo usage
-crowdsec-skill auth stats          # Today's auth summary
-```
-
-### System Logs
-Trigger: "syslog", "kernel errors", "security events"
-
-```bash
-crowdsec-skill syslog recent       # Recent syslog
-crowdsec-skill syslog errors       # Error entries
-crowdsec-skill syslog kernel       # Kernel/dmesg
-crowdsec-skill syslog security     # Security events
-crowdsec-skill logs recent|errors|watch|stats  # CrowdSec logs
-```
-
-### Firewall Management
-Trigger: "firewall status", "flush bans", "reload firewall"
-
-```bash
-crowdsec-skill firewall status     # ipset counts, rules
-crowdsec-skill firewall reload     # Reload bouncer
-crowdsec-skill firewall flush      # Clear all bans
-crowdsec-skill firewall switch <iptables|ufw>
-```
-
-### Whitelist Management
-Trigger: "whitelist ip", "add to whitelist"
-
-```bash
-crowdsec-skill whitelist list
-crowdsec-skill whitelist add <ip-or-cidr>
-crowdsec-skill whitelist remove <ip-or-cidr>
-```
-
-### Collections
-Trigger: "crowdsec collections", "install collection"
-
-```bash
-crowdsec-skill collections list
-crowdsec-skill collections available
-crowdsec-skill collections install <name>
-crowdsec-skill collections remove <name>
-```
-
-### Log Management
-Trigger: "log rotation", "log retention"
-
-```bash
-crowdsec-skill logging status
-crowdsec-skill logging setup
-crowdsec-skill logging retention <days>
-crowdsec-skill logging report [7d]
-crowdsec-skill logging rotate
-```
-
-### Service Management
-
-```bash
-crowdsec-skill services start|stop|restart|health
-```
-
-### Security Hardening
-Trigger: "hardening check", "security audit"
-
-```bash
-crowdsec-skill hardening
-```
-
-Checks SSH config, firewall, CrowdSec status, automatic updates, file permissions.
-
-### CrowdSec vs Fail2ban
-
-```bash
-crowdsec-skill compare
+tickets-skill sites          # list all
+tickets-skill status         # image/config info
 ```
 
 ## Agent Routing
 
-Best suited for:
-- **Pulse** (monitor): automated security checks, alert delivery
-- **Atlas** (infra): manual ban/unban, incident response, hardening
-- **Jarvis** (orchestrator): security status on demand
+| Agent | Commands | Use Case |
+|-------|----------|----------|
+| **Pulse** | `watch`, `check` | Automated polling, WhatsApp alert when found |
+| **Jarvis** | `check` | On-demand status query |
+| **Atlas** | `setup`, `status` | First-time setup, maintenance |
 
 ## Example Flows
 
-### WhatsApp: "Jarvis, are we under attack?"
+### WhatsApp: "Jarvis, any Taylor Swift tickets?"
 ```
-Jarvis -> routes to Pulse
-Pulse -> crowdsec-skill status
-Pulse -> formats response
-Pulse -> delivers via WhatsApp
-```
-
-### Cron: Daily security digest (08:00)
-```
-Pulse -> crowdsec-skill report --period 24h
-Pulse -> delivers summary via WhatsApp
+Jarvis -> tickets-skill check
+Jarvis -> formats result
+Jarvis -> delivers via WhatsApp
 ```
 
-### Cron: Proactive alert (every 15 min)
+### Cron: Check every 5 minutes, alert on availability
+```bash
+*/5 * * * * /usr/local/bin/tickets-skill check --json \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d['available_count'] else 1)" \
+  && openclaw agent --agent pulse \
+       -m "Taylor Swift tickets available! Check sites now." \
+       --deliver --reply-channel whatsapp --reply-to <number>
 ```
-crowdsec-skill alert || Pulse -> send WhatsApp alert
+
+### Continuous watch with built-in alerting
+```bash
+tickets-skill watch 5m
 ```
+
+## Requirements
+
+- Docker (image built via `tickets-skill setup`)
+- ~500 MB disk for the Playwright/Chromium image
+- Internet access to reach UK ticketing sites
